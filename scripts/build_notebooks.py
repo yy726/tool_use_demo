@@ -16,7 +16,7 @@ from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_URL = "https://github.com/yy726/tool_use_demo.git"
-REPO_BRANCH = "claude/inspiring-planck-c4a3hh"
+REPO_BRANCH = "claude/stoic-lamport-ms7oc9"
 
 
 def md(text: str):
@@ -85,11 +85,14 @@ else:
         except Exception:
             pass
         subprocess.run(["git", "clone", "--depth", "1", "--branch", REPO_BRANCH, url, REPO_DIR], check=True)
-    else:
-        subprocess.run(["git", "-C", REPO_DIR, "pull", "--ff-only"], check=False)
+    else:                                         # an older clone: move it to the latest commit of REPO_BRANCH
+        for cmd in (["fetch", "--depth", "1", "origin", REPO_BRANCH], ["checkout", "-f", "-B", REPO_BRANCH, "FETCH_HEAD"]):
+            done = subprocess.run(["git", "-C", REPO_DIR] + cmd, capture_output=True, text=True)
+            if done.returncode: print("WARNING: git", cmd[0], "failed, the code in", REPO_DIR, "may be stale:", done.stderr.strip())
 os.chdir(REPO_DIR)
 if REPO_DIR not in sys.path: sys.path.insert(0, REPO_DIR)
-print("repo:", REPO_DIR)
+head = subprocess.run(["git", "-C", REPO_DIR, "log", "-1", "--format=%h %s"], capture_output=True, text=True).stdout.strip()
+print("repo:", REPO_DIR, "@", head)
 '''
 
 SETUP = '''
