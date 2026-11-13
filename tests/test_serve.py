@@ -54,3 +54,34 @@ def test_wait_ready_reports_a_dead_server(tmp_path):
         wait_ready(dead, timeout=5, poll=0.1)
     with pytest.raises(TimeoutError):
         wait_ready(Endpoint(name="x", base_url="http://127.0.0.1:1/v1", api_key="EMPTY", log_path=str(log)), timeout=0.3, poll=0.1)
+
+
+def test_first_existing_repo_prefers_the_full_run_and_falls_back_to_smoke():
+    from planner.config import get_config
+    from planner.serve import first_existing_repo
+
+    candidates = [get_config(mode, "qwen3-1.7b").repo("me", "grpo", "GGUF") for mode in ("a100", "smoke")]
+    assert candidates == ["me/qwen3-1.7b-planner-grpo-GGUF", "me/qwen3-1.7b-planner-smoke-grpo-GGUF"]
+    assert first_existing_repo(candidates, exists=lambda repo: True) == candidates[0]
+    assert first_existing_repo(candidates, exists=lambda repo: "smoke" in repo) == candidates[1]
+    with pytest.raises(FileNotFoundError, match="none of these"):
+        first_existing_repo(candidates, exists=lambda repo: False)
+
+
+def test_first_existing_repo_prefers_the_first_candidate_that_exists():
+    from planner.serve import first_existing_repo
+
+    hub = {"me/planner-smoke-grpo-GGUF"}
+    assert first_existing_repo(["me/planner-grpo-GGUF", "me/planner-smoke-grpo-GGUF"], exists=hub.__contains__) == "me/planner-smoke-grpo-GGUF"
+    with pytest.raises(FileNotFoundError, match="planner-sft"):
+        first_existing_repo(["me/planner-sft"], exists=hub.__contains__)
+
+
+def test_corpus_save_creates_the_cache_directory(tmp_path):
+    from planner.corpus import Corpus
+
+    corpus = Corpus()
+    corpus.add("Paris", "Paris is the capital of France.")
+    path = tmp_path / "not" / "there" / "corpus.jsonl"
+    corpus.save(str(path))  # 03_demo failed here: /content/planner_env did not exist
+    assert len(Corpus.load(str(path))) == 1

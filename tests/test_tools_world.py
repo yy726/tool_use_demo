@@ -130,3 +130,12 @@ def test_bm25s_is_imported_without_jax():
     )
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert done.returncode == 0 and "ok" in done.stdout, done.stderr
+
+
+def test_corpus_save_creates_missing_directories(tmp_path):
+    """03_demo saves into a cache directory that does not exist yet on a fresh runtime."""
+    corpus = Corpus()
+    corpus.add("Paris", "Paris is the capital of France.")
+    path = tmp_path / "planner_env" / "nested" / "corpus.jsonl"
+    corpus.save(str(path))
+    assert len(Corpus.load(str(path))) == 1

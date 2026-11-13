@@ -737,7 +737,7 @@ A T4 is enough for `SERVER = "unsloth"`; `SERVER = "vllm"` needs an L4 or A100.
             '''
 HF_USER = ""                 # your Hugging Face user name ("" = take it from the HF_TOKEN secret)
 MODEL_KEY = "qwen3-1.7b"     # must match the training notebooks
-SMOKE = False                # True to serve the "-smoke" repositories from a SMOKE training run
+SMOKE = None                 # None: serve the full-run repositories if they exist, else the "-smoke" ones. True / False: force one.
 STAGES = ["sft", "grpo"]     # trained checkpoints to serve
 INCLUDE_BASE = True          # also serve the untuned base model for comparison
 SERVER = "unsloth"           # "unsloth" | "vllm" | "external"
@@ -763,15 +763,16 @@ from planner.config import get_config
 from planner.persist import read_secrets
 from planner.setup_env import setup_environment
 
-cfg = get_config("smoke" if SMOKE else "a100", MODEL_KEY)
+MODES = ["a100", "smoke"] if SMOKE is None else ["smoke" if SMOKE else "a100"]
+cfg = get_config("a100", MODEL_KEY)
 read_secrets(("HF_TOKEN",))
 if not HF_USER and os.environ.get("HF_TOKEN"):
     from huggingface_hub import whoami
     HF_USER = whoami(token=os.environ["HF_TOKEN"])["name"]
 assert HF_USER or SERVER == "external", "Set HF_USER (or add an HF_TOKEN secret)."
 
-# Rebuild the same world and knowledge base the models were trained against (about a minute).
-world, corpus = setup_environment(cache_dir="/content/planner_env", n_train=cfg.hotpot_train_rows, n_val=cfg.hotpot_val_rows, seed=cfg.seed)
+# The world and the full knowledge base the preset queries were picked from (about a minute to build).
+world, corpus = setup_environment(cache_dir="/content/planner_env", seed=cfg.seed)
 '''
         ),
         md(
@@ -785,7 +786,11 @@ Each checkpoint gets its own port. With `unsloth run`, the API key it prints on 
             '''
 import shutil
 from planner.demo import OpenAIBackend
-from planner.serve import Endpoint, start_unsloth, start_vllm, wait_ready
+from planner.serve import Endpoint, first_existing_repo, start_unsloth, start_vllm, wait_ready
+
+def hub_repo(stage, kind=""):
+    """The pushed repository of a checkpoint: from the full run, else from the SMOKE run."""
+    return first_existing_repo([get_config(mode, MODEL_KEY).repo(HF_USER, stage, kind) for mode in MODES])
 
 os.environ["PATH"] = os.path.expanduser("~/.local/bin") + os.pathsep + os.path.expanduser("~/.unsloth/bin") + os.pathsep + os.environ["PATH"]
 names = (["base"] if INCLUDE_BASE else []) + STAGES
@@ -798,12 +803,12 @@ else:
         try:
             if SERVER == "unsloth":
                 assert shutil.which("unsloth"), "the `unsloth` command is not on PATH: check the install cell's output"
-                repo = f"unsloth/{cfg.base_model_hf.split('/')[-1]}-GGUF" if name == "base" else cfg.repo(HF_USER, name, "GGUF")
+                repo = f"unsloth/{cfg.base_model_hf.split('/')[-1]}-GGUF" if name == "base" else hub_repo(name, "GGUF")
                 endpoints[name] = wait_ready(start_unsloth(name, repo, port, log, GGUF_VARIANT), key_from_log=True)
             else:
-                repo = cfg.base_model_hf if name == "base" else cfg.repo(HF_USER, name)
+                repo = cfg.base_model_hf if name == "base" else hub_repo(name)
                 endpoints[name] = wait_ready(start_vllm(name, repo, port, log, gpu_memory_utilization=round(0.85 / len(names), 2)))
-            print(f"{name}: ready at {endpoints[name].base_url}")
+            print(f"{name}: {repo} ready at {endpoints[name].base_url}")
         except Exception as error:
             print(f"{name}: could not start ({error})")
 
@@ -912,6 +917,9 @@ def write(name: str, cells) -> None:
 
 
 if __name__ == "__main__":
-    write("01_sft.ipynb", sft_notebook())
-    write("02_grpo.ipynb", grpo_notebook())
-    write("03_demo.ipynb", demo_notebook())
+    # `python scripts/build_notebooks.py 03_demo` rewrites only that notebook (writing a notebook drops its saved outputs).
+    import sys
+
+    builders = {"01_sft": sft_notebook, "02_grpo": grpo_notebook, "03_demo": demo_notebook}
+    for stem in sys.argv[1:] or list(builders):
+        write(f"{stem}.ipynb", builders[stem]())

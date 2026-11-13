@@ -39,6 +39,24 @@ class Endpoint:
             self.process.terminate()
 
 
+def first_existing_repo(candidates: list[str], exists=None) -> str:
+    """The first Hub repository in `candidates` that exists (e.g. the full-run repo, else the "-smoke" one).
+
+    The training notebooks push to different names in SMOKE mode, so the demo
+    looks for both instead of failing on a setting that does not match.
+    """
+    if exists is None:
+        import os
+
+        from huggingface_hub import repo_exists
+
+        exists = lambda repo: repo_exists(repo, token=os.environ.get("HF_TOKEN") or None)  # noqa: E731
+    for repo in candidates:
+        if exists(repo):
+            return repo
+    raise FileNotFoundError(f"none of these Hub repositories exist: {', '.join(candidates)}. Run the training notebook that pushes them (PUSH_TO_HUB and PUSH_GGUF on).")
+
+
 def find_unsloth_key(log_text: str) -> str | None:
     """The API key `unsloth run` prints to its console, if it is there yet."""
     matches = UNSLOTH_KEY_RE.findall(log_text)

@@ -119,6 +119,7 @@ class Corpus:
 
     # ------------------------------------------------------------ persistence
     def save(self, path: str) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             for p in self.passages:
