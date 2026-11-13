@@ -93,6 +93,7 @@ print("repo:", REPO_DIR)
 '''
 
 SETUP = '''
+os.environ.setdefault("UNSLOTH_DECODE_CUDA_GRAPHS", "0")   # eager decoding: the CUDA-graph decode path held ~30 GB outside PyTorch and ran an A100-40GB out of memory
 import unsloth  # import before transformers / trl so its patches apply
 import json, random
 from planner.config import get_config

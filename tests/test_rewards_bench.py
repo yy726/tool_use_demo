@@ -112,3 +112,37 @@ def test_malformed_call_is_answered_with_an_error(weather_tasks):
     completion = run_rollouts([T.build_prompt(task)], backend)[0]
     assert "error" in completion[1]["content"]
     assert evaluate([task], [completion])["summary"]["invalid_call_rate"] == 1.0
+
+
+def test_hf_generate_fn_retries_oom_in_halves():
+    torch = pytest.importorskip("torch")
+    from planner.unsloth_utils import hf_generate_fn
+
+    class Enc(dict):
+        def to(self, device):
+            return self
+
+    class Tok:
+        padding_side, pad_token_id, eos_token, pad_token = "right", 0, "</s>", "<pad>"
+
+        def __call__(self, prompts, **kw):
+            return Enc(input_ids=torch.zeros(len(prompts), 2, dtype=torch.long))
+
+        def batch_decode(self, out, skip_special_tokens=False):
+            return ["ok"] * out.shape[0]
+
+    class Model:
+        device = "cpu"
+        sizes = []
+
+        def generate(self, input_ids, **kw):
+            self.sizes.append(input_ids.shape[0])
+            if input_ids.shape[0] > 2:
+                raise torch.cuda.OutOfMemoryError("simulated")
+            return torch.zeros(input_ids.shape[0], 3, dtype=torch.long)
+
+    model, tok = Model(), Tok()
+    out = hf_generate_fn(model, tok, max_new_tokens=1, batch_size=8)([f"p{i}" for i in range(8)])
+    assert out == ["ok"] * 8
+    assert model.sizes == [8, 4, 2, 2, 4, 2, 2]  # 8 -> 4+4 -> 2+2 each, until it fits
+    assert tok.padding_side == "right"
