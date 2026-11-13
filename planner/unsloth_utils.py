@@ -79,8 +79,35 @@ def _clean(text: str, tokenizer) -> str:
 
 
 def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int = 32):
-    """Greedy batched generation with transformers. Call `FastLanguageModel.for_inference(model)` first."""
+    """Greedy batched generation with transformers. Call `FastLanguageModel.for_inference(model)` first.
+
+    Frees cached GPU memory between batches, and on a CUDA out-of-memory error retries the failed batch in halves
+    (down to one prompt) instead of losing the whole benchmark run.
+    """
     import torch
+
+    def free_memory():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def run(prompts: list[str]) -> list[str]:
+        enc = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
+        with torch.inference_mode():
+            out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id)
+        texts = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1] :], skip_special_tokens=False)
+        return [_clean(text, tokenizer) for text in texts]
+
+    def run_safe(prompts: list[str]) -> list[str]:
+        try:
+            return run(prompts)
+        except torch.cuda.OutOfMemoryError:
+            free_memory()
+            if len(prompts) == 1:
+                raise
+            half = len(prompts) // 2
+            print(f"CUDA out of memory with {len(prompts)} prompts: retrying as {half} + {len(prompts) - half}")
+            return run_safe(prompts[:half]) + run_safe(prompts[half:])
 
     def generate(prompts: list[str]) -> list[str]:
         order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))  # similar lengths -> less padding
@@ -90,12 +117,9 @@ def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int 
         try:
             for start in range(0, len(order), batch_size):
                 index = order[start : start + batch_size]
-                enc = tokenizer([prompts[i] for i in index], return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
-                with torch.inference_mode():
-                    out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id)
-                texts = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1] :], skip_special_tokens=False)
-                for i, text in zip(index, texts):
-                    outputs[i] = _clean(text, tokenizer)
+                for i, text in zip(index, run_safe([prompts[i] for i in index])):
+                    outputs[i] = text
+                free_memory()
         finally:
             tokenizer.padding_side = side
         return outputs
