@@ -195,3 +195,53 @@ def test_bfcl_commands_and_server_wait(tmp_path):
         bfcl.wait_for_server(1, process=dead, timeout=5, poll=0.1)
     bfcl.stop_server(None)
     bfcl.stop_server(dead)
+
+
+def test_vllm_python_prefers_this_environment_then_a_virtualenv(tmp_path, monkeypatch):
+    import importlib.util
+    import sys
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: object() if name == "vllm" else real_find_spec(name, *a))
+    assert bfcl.vllm_python(str(tmp_path / "venv")) == sys.executable
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "vllm" else real_find_spec(name, *a))
+    monkeypatch.setattr(bfcl, "gpu_memory_mib", lambda: 15360)  # T4
+    assert bfcl.vllm_python(str(tmp_path / "venv")) is None
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if "venv" in command:
+            (tmp_path / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(bfcl, "gpu_memory_mib", lambda: 40960)  # A100
+    monkeypatch.setattr(bfcl.subprocess, "run", fake_run)
+    python = bfcl.vllm_python(str(tmp_path / "venv"))
+    assert python == str(tmp_path / "venv" / "bin" / "python")
+    assert any(f"vllm=={bfcl.VLLM_VERSION}" in c for c in calls)
+    n = len(calls)
+    assert bfcl.vllm_python(str(tmp_path / "venv")) == python and len(calls) == n  # installed once
+
+
+def test_run_stage_skips_or_reports_instead_of_stopping_the_notebook(tmp_path, monkeypatch, capsys):
+    from planner.persist import StageCache
+
+    cache = StageCache(str(tmp_path), enabled=True)
+    config = SimpleNamespace(bfcl_model_id=bfcl.NOTHINK_ID, base_model_hf="Qwen/Qwen3-1.7B", bfcl_categories=["simple_python"])
+    monkeypatch.setattr(bfcl, "vllm_python", lambda: None)
+    assert bfcl.run_stage(cache, "base", config, str(tmp_path)) is None
+    assert "needs a GPU" in capsys.readouterr().out
+
+    def broken(**kwargs):
+        raise RuntimeError("model server exited with code 1 before becoming ready")
+
+    monkeypatch.setattr(bfcl, "vllm_python", lambda: "/venv/bin/python")
+    monkeypatch.setattr(bfcl, "run_bfcl", broken)
+    assert bfcl.run_stage(cache, "base", config, str(tmp_path)) is None
+    assert "FAILED" in capsys.readouterr().out and not cache.has("bfcl_base")
+
+    monkeypatch.setattr(bfcl, "run_bfcl", lambda **kwargs: {"core": 0.5, "server": kwargs["server_python"]})
+    assert bfcl.run_stage(cache, "base", config, str(tmp_path))["server"] == "/venv/bin/python"
+    assert cache.has("bfcl_base")

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -31,6 +32,31 @@ class Passage:
     def public(self) -> dict:
         """What the tool returns to the model (text is truncated to save context)."""
         return {"doc_id": self.doc_id, "title": self.title, "text": truncate_words(self.text)}
+
+
+def _import_bm25s():
+    """Import bm25s with its optional JAX backend switched off.
+
+    bm25s uses JAX for top-k selection when JAX is installed and runs a JAX op at
+    import time. On a GPU machine (Colab ships JAX) that makes JAX pre-allocate 75%
+    of the GPU - about 30 GB of an A100-40GB, invisible to PyTorch - and the model
+    then runs out of memory. numpy selection is all we need for k = 3.
+    """
+    if "bm25s" in sys.modules:
+        return sys.modules["bm25s"]
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")  # in case something else starts JAX later
+    hidden = {name: sys.modules.get(name) for name in ("jax", "jax.lax")}
+    for name in hidden:
+        sys.modules[name] = None  # makes `import jax.lax` raise ImportError inside bm25s
+    try:
+        import bm25s
+    finally:
+        for name, module in hidden.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+    return bm25s
 
 
 class Corpus:
@@ -71,8 +97,7 @@ class Corpus:
     # ---------------------------------------------------------------- search
     def _ensure_index(self):
         if self._retriever is None:
-            import bm25s
-
+            bm25s = _import_bm25s()
             retriever = bm25s.BM25()
             texts = [f"{p.title}. {p.text}" for p in self.passages]
             retriever.index(bm25s.tokenize(texts, stopwords="en", show_progress=False), show_progress=False)
@@ -80,8 +105,7 @@ class Corpus:
         return self._retriever
 
     def search(self, query: str, k: int = TOP_K) -> list[Passage]:
-        import bm25s
-
+        bm25s = _import_bm25s()
         query = str(query).strip()
         if not query:
             raise ValueError("query must be a non-empty string")
@@ -90,7 +114,7 @@ class Corpus:
         retriever = self._ensure_index()
         tokens = bm25s.tokenize([query], stopwords="en", show_progress=False)
         k = min(k, len(self.passages))
-        ids, scores = retriever.retrieve(tokens, k=k, show_progress=False)
+        ids, scores = retriever.retrieve(tokens, k=k, show_progress=False, backend_selection="numpy")
         return [self.passages[int(i)] for i, s in zip(ids[0], scores[0]) if s > 0]
 
     # ------------------------------------------------------------ persistence

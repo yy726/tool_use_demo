@@ -7,9 +7,9 @@ Face Hub and served for a small demo app.
 
 | notebook | what it does | runtime (Qwen3-1.7B, A100, estimate) |
 |---|---|---|
-| [`notebooks/01_sft.ipynb`](notebooks/01_sft.ipynb) | base-model evaluation, SFT data mix, SFT, push | ~2-3 h |
-| [`notebooks/02_grpo.ipynb`](notebooks/02_grpo.ipynb) | GRPO with real multi-round tool rollouts, evaluation, push | ~3-6 h |
-| [`notebooks/03_demo.ipynb`](notebooks/03_demo.ipynb) | serve the checkpoints, five preset hard queries, web app | minutes |
+| [`notebooks/01_sft.ipynb`](notebooks/01_sft.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yy726/tool_use_demo/blob/main/notebooks/01_sft.ipynb) | base-model evaluation, SFT data mix, SFT, push | ~2-3 h |
+| [`notebooks/02_grpo.ipynb`](notebooks/02_grpo.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yy726/tool_use_demo/blob/main/notebooks/02_grpo.ipynb) | GRPO with real multi-round tool rollouts, evaluation, push | ~3-6 h |
+| [`notebooks/03_demo.ipynb`](notebooks/03_demo.ipynb) [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/yy726/tool_use_demo/blob/main/notebooks/03_demo.ipynb) | serve the checkpoints, five preset hard queries, web app | minutes |
 
 The run times are estimates and have not been measured. Use the `SMOKE = True` switch at the top of each notebook
 first: it runs the whole pipeline on tiny data in minutes.
@@ -18,7 +18,7 @@ first: it runs the whole pipeline on tiny data in minutes.
 
 1. In Colab, add the secrets `HF_TOKEN` (write access) and `WANDB_API_KEY` (key icon in the left bar). If this
    repository is private, also add `GITHUB_TOKEN`.
-2. Open `01_sft.ipynb` on an A100 or L4 runtime, leave `SMOKE = True`, and *Run all*.
+2. Open `01_sft.ipynb` with its *Open in Colab* button on an A100 or L4 runtime, leave `SMOKE = True`, and *Run all*.
 3. Do the same with `02_grpo.ipynb`. When both pass, set `SMOKE = False` in both and run them again.
 4. Open `03_demo.ipynb` to try the models.
 
@@ -160,6 +160,9 @@ tasks, about one minute); conversion and rendering of the real ToolACE and Herme
 the benchmark, reward and demo loops driven by the scripted expert; registration of the non-thinking BFCL handler with
 the real `bfcl-eval` package.
 
+A Colab A100 run of `01_sft.ipynb` got as far as the first benchmark and exposed the `bm25s` / JAX problem below and
+an install line that failed silently; both are fixed, but the fixed notebook has not been re-run on Colab yet.
+
 Not verified, because it needs a GPU and Colab: the training runs themselves and any resulting scores, checkpoint
 resume inside the Unsloth-patched trainers, the vLLM server started for BFCL, GGUF export, and `unsloth run` on Colab.
 The `SMOKE` mode exists to check exactly these quickly. Known fallbacks: set `RUN_BFCL = False` to skip BFCL, use
@@ -167,8 +170,14 @@ The `SMOKE` mode exists to check exactly these quickly. Known fallbacks: set `RU
 
 Two details worth knowing:
 
-- `bfcl-eval` pins old versions of numpy and other packages. It therefore runs from a separate virtualenv and talks
-  to a vLLM server started from the training environment.
+- `bfcl-eval` pins old versions of numpy and other packages, so it runs from a separate virtualenv and talks to a
+  vLLM server. In `01_sft.ipynb` that server also has its own virtualenv, so Colab's torch and numpy are left alone;
+  `02_grpo.ipynb` needs vLLM in the notebook's own environment (Unsloth's `fast_inference` engine) and installs it there.
+- `bm25s` switches to JAX when JAX is installed, and JAX pre-allocates 75% of the GPU (about 30 GB of an A100-40GB,
+  invisible to PyTorch). The first `knowledge_search` call therefore made the next generation step run out of memory.
+  `planner/corpus.py` imports `bm25s` with JAX hidden and selects with numpy.
+- Everything lives on the `main` branch. Colab cannot resolve notebook paths on branches with a `/` in the name
+  (saving back to GitHub then creates a stray folder named after the branch), so the notebooks clone `main`.
 - TRL's tool loop only accepts chat templates it recognises, and Unsloth's tokenizers ship modified Qwen3 templates.
   `planner/chat.py` resets the tokenizer to TRL's canonical template and uses TRL's training variant (which always
   writes the `<think>` block of an assistant turn) for SFT text and benchmark prompts, so every stage sees one format.

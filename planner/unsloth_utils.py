@@ -79,7 +79,7 @@ def _clean(text: str, tokenizer) -> str:
 
 
 def gpu_report(tag: str = "") -> None:
-    """Print where GPU memory is: PyTorch's allocator vs. everything else in this process (graphs, cuda context, ...)."""
+    """Print where GPU memory is: PyTorch's allocator vs. everything else (cuda context, other GPU libraries, other processes)."""
     import subprocess
 
     import torch
@@ -93,8 +93,8 @@ def gpu_report(tag: str = "") -> None:
         f"[gpu {tag}] total {gib(total)} GiB | free {gib(free)} | torch allocated {gib(torch.cuda.memory_allocated())}"
         f" | torch reserved {gib(reserved)} | used OUTSIDE torch's allocator {gib(total - free - reserved)}"
     )
-    flags = {k: os.environ.get(k) for k in ("UNSLOTH_DECODE_CUDA_GRAPHS", "UNSLOTH_BLOCK_CUDAGRAPHS", "UNSLOTH_VLLM_STANDBY")}
-    print(f"[gpu {tag}] env {flags}")
+    if total - free - reserved > 4 * 2**30:
+        print(f"[gpu {tag}] several GiB are held outside PyTorch: another GPU library in this process (JAX and TensorFlow pre-allocate) or another process")
     try:
         apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"], capture_output=True, text=True, timeout=20).stdout.strip()
         print(f"[gpu {tag}] processes on this GPU (pid, memory): {apps or 'none reported'}")

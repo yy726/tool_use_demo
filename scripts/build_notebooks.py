@@ -16,7 +16,8 @@ from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_URL = "https://github.com/yy726/tool_use_demo.git"
-REPO_BRANCH = "claude/stoic-lamport-ms7oc9"
+REPO_SLUG = "yy726/tool_use_demo"
+REPO_BRANCH = "main"  # no "/" in the name: Colab cannot resolve notebook paths on branches like "a/b"
 
 
 def md(text: str):
@@ -28,41 +29,81 @@ def code(text: str):
 
 
 # --------------------------------------------------------------- shared cells
-# Same install cell as Unsloth's "Qwen3 (4B) GRPO Tool Use" notebook, plus the retriever and W&B.
-INSTALL = r'''
-%%capture
-import os
-os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
-!pip install --upgrade -qqq uv
-if "COLAB_" not in "".join(os.environ.keys()):
-    !pip install unsloth vllm
-else:
-    try: import numpy, PIL; _numpy = f'numpy=={numpy.__version__}'; _pil = f'pillow=={PIL.__version__}'
-    except: _numpy = "numpy"; _pil = "pillow"
-    try: import subprocess; is_t4 = "Tesla T4" in str(subprocess.check_output(["nvidia-smi"]))
-    except: is_t4 = False
-    if is_t4:
-        # Keep the machine's torch: upgrading it can pull a CUDA build the driver cannot load
-        try:
-            import importlib.metadata as _md
-            _torch, _tv = (f'{_p}=={_md.version(_p).split("+")[0]}' for _p in ('torch', 'torchvision'))
-        except Exception:
-            _torch, _tv = 'torch', 'torchvision'
-        !uv pip install -qqq {_numpy} {_pil} {_torch} {_tv} bitsandbytes xformers unsloth
-    else:
-        !uv pip install -qqq --upgrade vllm==0.19.1 {_numpy} {_pil} torchvision bitsandbytes xformers unsloth
+def badge(name: str):
+    """The "Open in Colab" button, as in the Unsloth notebooks."""
+    url = f"https://colab.research.google.com/github/{REPO_SLUG}/blob/{REPO_BRANCH}/notebooks/{name}"
+    return md(f'<a href="{url}" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>')
+
+
+_INSTALL_TAIL = r"""
     !uv pip install -qqq triton
-    try:
-        import importlib.metadata as _md; _torch_v = tuple(int(_p) for _p in _md.version("torch").split("+")[0].split(".")[:2])
-    except Exception:
-        _torch_v = ()
+    try: _torch_v = tuple(int(_p) for _p in _md.version("torch").split("+")[0].split(".")[:2])
+    except Exception: _torch_v = ()
     _torchao = "torchao>=0.16.0" if _torch_v >= (2, 10) else "torchao>=0.16.0,<0.18.0"
     !uv pip install -qqq --no-deps --upgrade "{_torchao}"
 !uv pip install transformers==5.15.1 "datasets>=4.7.0,<5.0.0"
 !uv pip install --no-deps trl==1.13.0
 !uv pip install -qqq --no-deps --force-reinstall "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" "unsloth @ git+https://github.com/unslothai/unsloth"
 !uv pip install -qqq bm25s==0.3.16 wandb
-'''
+"""
+
+# 01_sft: Unsloth's install cell for a runtime without the vLLM engine. Colab's torch / numpy / pillow stay as they are;
+# the vLLM server that BFCL needs is installed into its own virtualenv by planner/bfcl.py.
+INSTALL_SFT = r"""
+%%capture
+import os
+import importlib.metadata as _md
+!pip install --upgrade -qqq uv
+if "COLAB_" not in "".join(os.environ.keys()):
+    !pip install unsloth
+else:
+    def _pin(_p):
+        try: return f'{_p}=={_md.version(_p).split("+")[0]}'
+        except Exception: return _p
+    _pins = " ".join(_pin(_p) for _p in ("numpy", "pillow", "torch", "torchvision"))
+    !uv pip install -qqq {_pins} bitsandbytes unsloth""" + _INSTALL_TAIL
+
+# 02_grpo: the install cell of Unsloth's "Qwen3 (4B) GRPO Tool Use" notebook (vLLM engine on anything but a T4).
+# One change: that cell pins Colab's numpy, and vllm 0.19.1 cannot be installed next to numpy >= 2.3 - the whole
+# command then fails silently under %%capture. So on failure it is retried without the numpy / pillow pins.
+INSTALL_GRPO = r"""
+%%capture
+import os
+import importlib.metadata as _md
+os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
+!pip install --upgrade -qqq uv
+if "COLAB_" not in "".join(os.environ.keys()):
+    !pip install unsloth vllm
+else:
+    def _pin(_p):
+        try: return f'{_p}=={_md.version(_p).split("+")[0]}'
+        except Exception: return _p
+    try: import subprocess; is_t4 = "Tesla T4" in str(subprocess.check_output(["nvidia-smi"]))
+    except: is_t4 = False
+    if is_t4:
+        # Keep the machine's torch: upgrading it can pull a CUDA build the driver cannot load
+        _pins = " ".join(_pin(_p) for _p in ("numpy", "pillow", "torch", "torchvision"))
+        !uv pip install -qqq {_pins} bitsandbytes xformers unsloth
+    else:
+        _cmd = "uv pip install -qqq --upgrade vllm==0.19.1 {} {} torchvision bitsandbytes xformers unsloth"
+        if os.system(_cmd.format(_pin("numpy"), _pin("pillow"))) != 0:
+            os.system(_cmd.format("numpy", "pillow"))""" + _INSTALL_TAIL
+
+# The install cells are silent (%%capture), so say what actually got installed.
+CHECK = r"""
+import importlib.metadata as _md, sys
+
+def _installed(_p):
+    try: return _md.version(_p)
+    except Exception: return None
+
+print(" | ".join(f"{_p} {_installed(_p) or 'NOT INSTALLED'}" for _p in ("torch", "numpy", "transformers", "trl", "unsloth", "vllm", "bitsandbytes")))
+_missing = [_p for _p in ("torch", "transformers", "trl", "unsloth", "unsloth_zoo", "bm25s") if not _installed(_p)]
+assert not _missing, f"The install cell failed for {_missing}. Remove its first line (%%capture), run it again and read the error."
+_stale = [_m for _m, _p in (("numpy", "numpy"), ("PIL", "pillow"), ("torch", "torch"))
+          if _m in sys.modules and getattr(sys.modules[_m], "__version__", "").split("+")[0] != (_installed(_p) or "").split("+")[0]]
+assert not _stale, f"The install replaced {_stale} after this session had loaded it. Choose Runtime > Restart session, then Run all again."
+"""
 
 CLONE = f'''
 import os, subprocess, sys
@@ -96,11 +137,6 @@ print("repo:", REPO_DIR, "@", head)
 '''
 
 SETUP = '''
-# This notebook only trains and runs plain transformers generation (no vLLM engine). Unsloth's per-length CUDA graphs
-# (decode graphs, and torch.compile cudagraphs on the decoder blocks) hold GPU memory outside PyTorch's allocator
-# and ran an A100-40GB out of memory during the benchmark, so turn them off.
-os.environ.setdefault("UNSLOTH_DECODE_CUDA_GRAPHS", "0")
-os.environ.setdefault("UNSLOTH_BLOCK_CUDAGRAPHS", "0")
 import unsloth  # import before transformers / trl so its patches apply
 import json, random
 from planner.config import get_config
@@ -151,6 +187,7 @@ def bench(name, lora_dir=None):
 # ------------------------------------------------------------------ 01_sft
 def sft_notebook():
     cells = [
+        badge("01_sft.ipynb"),
         md(
             """
 # 01 - Supervised fine-tuning of a tool-calling planner
@@ -174,7 +211,7 @@ disconnect just *Run all* again. Finished stages are skipped and training resume
 
 **Before you start:** add `HF_TOKEN` (write access) and `WANDB_API_KEY` to Colab *Secrets* (key icon in the left
 bar), and pick an **A100** or **L4** runtime. Run once with `SMOKE = True` (a few minutes, tiny data) to check the
-whole pipeline end to end, then set `SMOKE = False`. On a T4 the BFCL stage is skipped, because it needs vLLM.
+whole pipeline end to end, then set `SMOKE = False`. On a T4 the BFCL stage is skipped: its vLLM server needs a larger GPU.
 """
         ),
         md("## 1. Configuration"),
@@ -185,7 +222,7 @@ MODEL_KEY = "qwen3-1.7b"     # or "qwen3-4b-instruct" (the model of the Unsloth 
 ENABLE_THINKING = False      # Qwen3-1.7B only: let the planner think before calling tools
 USE_DRIVE = True             # checkpoints and caches on Google Drive
 RESUME = True                # reuse finished stages and checkpoints found on Drive
-RUN_BFCL = True              # official BFCL evaluation (needs vLLM: A100 / L4)
+RUN_BFCL = True              # official BFCL evaluation (A100 / L4; installs vLLM into its own virtualenv)
 WANDB_PROJECT = "tool-use-planner"
 PUSH_TO_HUB = True           # push adapter + merged model (+ GGUF) to your Hugging Face account
 HF_PRIVATE = False
@@ -193,8 +230,9 @@ PUSH_GGUF = True             # needed for Unsloth Studio / llama.cpp serving in 
 OVERRIDES = {}               # e.g. {"sft_epochs": 1, "n_toolace": 5000}; see planner/config.py
 '''
         ),
-        md("## 2. Install and set up\nThe install cell is the one from Unsloth's *Qwen3 (4B) GRPO Tool Use* notebook, so both notebooks share one software stack."),
-        code(INSTALL),
+        md("## 2. Install and set up\nThe install cell follows Unsloth's notebooks and keeps Colab's own torch and numpy. It is silent; the cell after it prints what was installed."),
+        code(INSTALL_SFT),
+        code(CHECK),
         code(CLONE),
         code(SETUP),
         md(
@@ -207,7 +245,7 @@ on it. We run the offline categories (about 4,400 test entries) with BFCL's own 
 the four official groups plus their mean, **BFCL-core**. The agentic group (web search needs a paid key) is not run, so
 BFCL-core is not the leaderboard's overall score.
 
-BFCL pins old package versions, so it runs from its own virtualenv and talks to a vLLM server started here. This is why
+BFCL pins old package versions, so it runs from its own virtualenv and talks to a vLLM server (also in its own virtualenv; the first run installs it, which takes a few minutes). This is why
 it runs *before* the training model is loaded. For Qwen3-1.7B the model is evaluated in non-thinking mode at every
 stage, so the three checkpoints are compared like for like.
 """
@@ -391,6 +429,7 @@ print("Done. Next: 02_grpo.ipynb (it evaluates this checkpoint on BFCL first).")
 # ----------------------------------------------------------------- 02_grpo
 def grpo_notebook():
     cells = [
+        badge("02_grpo.ipynb"),
         md(
             """
 # 02 - GRPO on a mock tool environment
@@ -430,7 +469,8 @@ OVERRIDES = {}               # e.g. {"grpo_steps": 200}; see planner/config.py
 '''
         ),
         md("## 2. Install and set up"),
-        code(INSTALL),
+        code(INSTALL_GRPO),
+        code(CHECK),
         code(CLONE),
         code("OVERRIDES = dict(OVERRIDES, reward_mode=REWARD_MODE)\n" + SETUP.strip("\n")),
         md(
@@ -628,7 +668,7 @@ BFCL cell in section 3 scores the GRPO checkpoint.
             '''
 from planner.unsloth_utils import gpu_free_fraction, release_gpu
 
-if RUN_BFCL and not BFCL.get("grpo") and has_vllm():
+if RUN_BFCL and not BFCL.get("grpo"):
     try: del trainer
     except NameError: pass
     del model
@@ -673,6 +713,7 @@ These are expectations, not guarantees: compare them with the tables above. To t
 # ----------------------------------------------------------------- 03_demo
 def demo_notebook():
     cells = [
+        badge("03_demo.ipynb"),
         md(
             """
 # 03 - Demo: try the planner

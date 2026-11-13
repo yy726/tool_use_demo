@@ -99,3 +99,34 @@ def test_corpus_dedupes_saves_and_loads(tmp_path, corpus):
     assert loaded.search("Glass Orchard opera")[0].title == "Glass Orchard"
     assert truncate_words("a b c d", 2) == "a b ..."
     assert Corpus().search("anything") == []
+
+
+def test_bm25s_is_imported_without_jax():
+    """bm25s must not start JAX: on a GPU machine JAX pre-allocates 75% of the GPU (the 01_sft OOM)."""
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent(
+        """
+        import os, sys, tempfile
+        root = tempfile.mkdtemp()                      # a fake `jax` that records being used
+        os.makedirs(os.path.join(root, "jax"))
+        open(os.path.join(root, "jax", "__init__.py"), "w").write("USED = []\\n")
+        open(os.path.join(root, "jax", "lax.py"), "w").write(
+            "import jax\\ndef top_k(*a, **k):\\n    jax.USED.append(1)\\n    raise RuntimeError('jax was used')\\n")
+        sys.path.insert(0, root)
+        import jax                                      # already imported by something else, as on Colab
+        from planner.corpus import Corpus
+        corpus = Corpus()
+        corpus.add("Paris", "Paris is the capital of France.")
+        corpus.add("Rome", "Rome is the capital of Italy.")
+        assert [p.title for p in corpus.search("capital of France", k=1)] == ["Paris"]
+        import bm25s.selection as selection
+        assert selection.JAX_IS_AVAILABLE is False and jax.USED == []
+        assert sys.modules["jax"] is jax               # the caller's own jax is left alone
+        print("ok")
+        """
+    )
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert done.returncode == 0 and "ok" in done.stdout, done.stderr
