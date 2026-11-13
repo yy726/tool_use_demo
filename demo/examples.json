@@ -1,0 +1,347 @@
+[
+  {
+    "label": "Bridge / multi-hop",
+    "why": "The second search depends on an entity found by the first one.",
+    "task": {
+      "query": "What year was the author of Cock and Bull born?",
+      "aspects": [
+        {
+          "name": "kb:bridge",
+          "answers": [
+            "1961"
+          ],
+          "answer_type": "text",
+          "evidence": [
+            {
+              "type": "doc",
+              "doc_id": "D078285",
+              "title": "Cock and Bull (book)"
+            },
+            {
+              "type": "doc",
+              "doc_id": "D078286",
+              "title": "Will Self"
+            }
+          ],
+          "multi_hop": true,
+          "constraint_args": []
+        }
+      ],
+      "optimal_plan": [
+        [
+          {
+            "tool": "knowledge_search",
+            "args": {
+              "query": "Cock and Bull (book)"
+            }
+          }
+        ],
+        [
+          {
+            "tool": "knowledge_search",
+            "args": {
+              "query": "Will Self"
+            }
+          }
+        ]
+      ],
+      "meta": {
+        "hotpot_id": "5a7ab51055429927d897bef6"
+      },
+      "task_id": "kb_bridge-eval-00012",
+      "family": "kb_bridge",
+      "split": "eval",
+      "optimal_cost": 2.0
+    }
+  },
+  {
+    "label": "Decomposition + fan-out + synthesis",
+    "why": "Two entities must be looked up in parallel and then compared.",
+    "task": {
+      "query": "Which genus has more species, Bactris and Epigaea?",
+      "aspects": [
+        {
+          "name": "kb:comparison",
+          "answers": [
+            "Bactris"
+          ],
+          "answer_type": "text",
+          "evidence": [
+            {
+              "type": "doc",
+              "doc_id": "D078887",
+              "title": "Bactris"
+            },
+            {
+              "type": "doc",
+              "doc_id": "D078886",
+              "title": "Epigaea"
+            }
+          ],
+          "multi_hop": false,
+          "constraint_args": []
+        }
+      ],
+      "optimal_plan": [
+        [
+          {
+            "tool": "knowledge_search",
+            "args": {
+              "query": "Bactris"
+            }
+          },
+          {
+            "tool": "knowledge_search",
+            "args": {
+              "query": "Epigaea"
+            }
+          }
+        ]
+      ],
+      "meta": {
+        "hotpot_id": "5a87954f5542996e4f308856"
+      },
+      "task_id": "kb_compare-eval-00014",
+      "family": "kb_compare",
+      "split": "eval",
+      "optimal_cost": 2.0
+    }
+  },
+  {
+    "label": "Multi-date fan-out + calculation",
+    "why": "Three weather lookups in one round, then the calculator combines them.",
+    "task": {
+      "query": "Average the temperatures in Ossburg on 2024-03-31, 2024-04-02 and 2024-04-04.",
+      "aspects": [
+        {
+          "name": "calc:temp_avg",
+          "answers": [
+            "11.0"
+          ],
+          "answer_type": "number",
+          "evidence": [
+            {
+              "type": "call",
+              "tool": "get_weather",
+              "args": {
+                "city": "Ossburg",
+                "date": "2024-03-31"
+              }
+            },
+            {
+              "type": "call",
+              "tool": "get_weather",
+              "args": {
+                "city": "Ossburg",
+                "date": "2024-04-02"
+              }
+            },
+            {
+              "type": "call",
+              "tool": "get_weather",
+              "args": {
+                "city": "Ossburg",
+                "date": "2024-04-04"
+              }
+            },
+            {
+              "type": "calc",
+              "value": 11.0
+            }
+          ],
+          "multi_hop": false,
+          "constraint_args": [
+            "date",
+            "year"
+          ]
+        }
+      ],
+      "optimal_plan": [
+        [
+          {
+            "tool": "get_weather",
+            "args": {
+              "city": "Ossburg",
+              "date": "2024-03-31"
+            }
+          },
+          {
+            "tool": "get_weather",
+            "args": {
+              "city": "Ossburg",
+              "date": "2024-04-02"
+            }
+          },
+          {
+            "tool": "get_weather",
+            "args": {
+              "city": "Ossburg",
+              "date": "2024-04-04"
+            }
+          }
+        ],
+        [
+          {
+            "tool": "calculator",
+            "args": {
+              "expression": "(10.7 + 12.8 + 9.5) / 3"
+            }
+          }
+        ]
+      ],
+      "task_id": "fanout_calc-eval-00019",
+      "family": "fanout_calc",
+      "split": "eval",
+      "optimal_cost": 1.0,
+      "meta": {}
+    }
+  },
+  {
+    "label": "Cross-tool bridge + tool selection",
+    "why": "The election result supplies the capital and the date for the weather call.",
+    "task": {
+      "query": "Describe the weather in Quenia's capital on the day of the 2016 election.",
+      "aspects": [
+        {
+          "name": "bridge:condition",
+          "answers": [
+            "foggy"
+          ],
+          "answer_type": "text",
+          "evidence": [
+            {
+              "type": "call",
+              "tool": "get_election",
+              "args": {
+                "region": "Quenia",
+                "year": 2016
+              }
+            },
+            {
+              "type": "call",
+              "tool": "get_weather",
+              "args": {
+                "city": "Brenmouth",
+                "date": "2016-04-09"
+              }
+            }
+          ],
+          "multi_hop": true,
+          "constraint_args": [
+            "year",
+            "date"
+          ]
+        }
+      ],
+      "optimal_plan": [
+        [
+          {
+            "tool": "get_election",
+            "args": {
+              "region": "Quenia",
+              "year": 2016
+            }
+          }
+        ],
+        [
+          {
+            "tool": "get_weather",
+            "args": {
+              "city": "Brenmouth",
+              "date": "2016-04-09"
+            }
+          }
+        ]
+      ],
+      "task_id": "tool_bridge-eval-00031",
+      "family": "tool_bridge",
+      "split": "eval",
+      "optimal_cost": 0.5,
+      "meta": {}
+    }
+  },
+  {
+    "label": "Multi-part ask: fan-out + query reformulation",
+    "why": "Searching with the whole question retrieves nothing useful; it has to be split, and the knowledge part needs a follow-up query.",
+    "task": {
+      "query": "Two questions. First: Who was the runner-up in Fenonia's 2024 election? Second: What kind of comedian was Michael Mclntyre's father?",
+      "aspects": [
+        {
+          "name": "kb:bridge",
+          "answers": [
+            "Canadian comedian"
+          ],
+          "answer_type": "text",
+          "evidence": [
+            {
+              "type": "doc",
+              "doc_id": "D080074",
+              "title": "Ray Cameron (comedian)"
+            },
+            {
+              "type": "doc",
+              "doc_id": "D080078",
+              "title": "Michael McIntyre"
+            }
+          ],
+          "multi_hop": true,
+          "constraint_args": []
+        },
+        {
+          "name": "election:runner_up",
+          "answers": [
+            "Greta Lindqvist"
+          ],
+          "answer_type": "text",
+          "evidence": [
+            {
+              "type": "call",
+              "tool": "get_election",
+              "args": {
+                "region": "Fenonia",
+                "year": 2024
+              }
+            }
+          ],
+          "multi_hop": false,
+          "constraint_args": [
+            "year"
+          ]
+        }
+      ],
+      "optimal_plan": [
+        [
+          {
+            "tool": "knowledge_search",
+            "args": {
+              "query": "Ray Cameron (comedian)"
+            }
+          },
+          {
+            "tool": "get_election",
+            "args": {
+              "region": "Fenonia",
+              "year": 2024
+            }
+          }
+        ],
+        [
+          {
+            "tool": "knowledge_search",
+            "args": {
+              "query": "Michael McIntyre"
+            }
+          }
+        ]
+      ],
+      "meta": {
+        "hotpot_id": "5ae66b055542995703ce8b61",
+        "kb_question": "What kind of comedian was Michael Mclntyre's father?"
+      },
+      "task_id": "composite-eval-00083",
+      "family": "composite",
+      "split": "eval",
+      "optimal_cost": 2.25
+    }
+  }
+]
