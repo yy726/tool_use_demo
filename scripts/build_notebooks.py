@@ -93,7 +93,11 @@ print("repo:", REPO_DIR)
 '''
 
 SETUP = '''
-os.environ.setdefault("UNSLOTH_DECODE_CUDA_GRAPHS", "0")   # eager decoding: the CUDA-graph decode path held ~30 GB outside PyTorch and ran an A100-40GB out of memory
+# This notebook only trains and runs plain transformers generation (no vLLM engine). Unsloth's per-length CUDA graphs
+# (decode graphs, and torch.compile cudagraphs on the decoder blocks) hold GPU memory outside PyTorch's allocator
+# and ran an A100-40GB out of memory during the benchmark, so turn them off.
+os.environ.setdefault("UNSLOTH_DECODE_CUDA_GRAPHS", "0")
+os.environ.setdefault("UNSLOTH_BLOCK_CUDAGRAPHS", "0")
 import unsloth  # import before transformers / trl so its patches apply
 import json, random
 from planner.config import get_config
@@ -124,7 +128,7 @@ from unsloth import FastLanguageModel
 from planner.bench import format_report, run_benchmark, text_backend
 from planner.chat import setup_chat_format
 from planner.tasks import build_prompt
-from planner.unsloth_utils import has_vllm, hf_generate_fn, load_lora_weights, load_model, vllm_generate_fn
+from planner.unsloth_utils import gpu_report, has_vllm, hf_generate_fn, load_lora_weights, load_model, vllm_generate_fn
 
 MAX_NEW = cfg.bench_max_new_tokens * (4 if cfg.enable_thinking else 1)
 
@@ -219,6 +223,7 @@ if BFCL["base"]: print(bfcl.format_table({"base": BFCL["base"]}))
             + '''
 FAST = False                                       # SFT notebook: plain transformers generation
 model, tokenizer = load_model(cfg, fast_inference=False)
+gpu_report("after model load")
 fmt = setup_chat_format(tokenizer, enable_thinking=cfg.enable_thinking)
 print(fmt.render_prompt(build_prompt(env.tasks["eval"][0]))[-700:])
 '''

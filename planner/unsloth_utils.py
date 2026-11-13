@@ -78,6 +78,30 @@ def _clean(text: str, tokenizer) -> str:
     return text.replace(tokenizer.pad_token or "", "") if tokenizer.pad_token else text
 
 
+def gpu_report(tag: str = "") -> None:
+    """Print where GPU memory is: PyTorch's allocator vs. everything else in this process (graphs, cuda context, ...)."""
+    import subprocess
+
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    free, total = torch.cuda.mem_get_info()
+    gib = lambda n: f"{n / 2**30:.2f}"
+    reserved = torch.cuda.memory_reserved()
+    print(
+        f"[gpu {tag}] total {gib(total)} GiB | free {gib(free)} | torch allocated {gib(torch.cuda.memory_allocated())}"
+        f" | torch reserved {gib(reserved)} | used OUTSIDE torch's allocator {gib(total - free - reserved)}"
+    )
+    flags = {k: os.environ.get(k) for k in ("UNSLOTH_DECODE_CUDA_GRAPHS", "UNSLOTH_BLOCK_CUDAGRAPHS", "UNSLOTH_VLLM_STANDBY")}
+    print(f"[gpu {tag}] env {flags}")
+    try:
+        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader"], capture_output=True, text=True, timeout=20).stdout.strip()
+        print(f"[gpu {tag}] processes on this GPU (pid, memory): {apps or 'none reported'}")
+    except Exception:
+        pass
+
+
 def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int = 32):
     """Greedy batched generation with transformers. Call `FastLanguageModel.for_inference(model)` first.
 
@@ -102,6 +126,7 @@ def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int 
         try:
             return run(prompts)
         except torch.cuda.OutOfMemoryError:
+            gpu_report(f"OOM with {len(prompts)} prompts")
             free_memory()
             if len(prompts) == 1:
                 raise
