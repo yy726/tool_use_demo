@@ -1,0 +1,11 @@
+# Runtime deps for the planner package (training stack is installed by the notebooks).
+bm25s==0.3.16
+numpy
+datasets
+huggingface_hub
+# Demo
+openai
+gradio
+# Dev
+pytest
+nbformat
