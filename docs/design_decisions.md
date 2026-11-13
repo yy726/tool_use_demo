@@ -52,15 +52,27 @@ model quality. Every statement about expected improvement below is a design expe
 |---|---|---|
 | ToolACE | ~10,000 | General function calling: unseen schemas, parallel calls, declining to call |
 | Hermes function calling | ~1,100 | Same, in the format of the Unsloth tool-calling notebook |
-| Scripted-expert rollouts | ~1,900 | Our four tools and our task shapes |
+| Scripted-expert rollouts | ~2,500 | Our four tools and our task shapes |
+| Teacher rollouts (rejection sampling) | up to ~360 | The multi-hop tasks the expert could not solve |
 
-- The expert really executes the tools, and only rollouts scoring 4 on both axes are kept. This is the simplest form
-  of rejection sampling.
-- The expert is deliberately plain (search with the question, then with an entity seen in the results). It scores 92%
-  on the held-out set and only 69% on `kb_bridge`, which leaves room for RL to beat the demonstrations.
+- The expert really executes the tools, and only rollouts scoring 4 on both axes are kept.
+- The expert is deliberately plain (search with the question, then with an entity seen in the results). It is perfect
+  on the synthetic families but solves only about 69% of `kb_bridge` and `dual_bridge` and 78% of `composite`. SFT
+  on the expert alone is therefore capped at roughly that level on exactly the hard families.
+- **Teacher by rejection sampling.** For the tasks the expert fails, a stronger model (Qwen3-14B by default, or any
+  OpenAI-compatible endpoint) attempts the task in the same environment, up to four times at temperature 0.7. The
+  benchmark's own scorer decides: only rollouts scoring 4 on both axes become demonstrations. The teacher's prose is
+  stripped, so the student sees the plan and the short answer, in the same format as the expert's rollouts.
+- Why this is safe: a wrong or wasteful teacher rollout cannot enter the data, because acceptance is decided by the
+  scorer, not by the teacher.
+- Two thirds of the in-domain SFT tasks need two or three rounds.
 
-### GRPO (4,000 tasks, 500 per family)
+### GRPO (4,000 tasks, weighted towards multi-step)
 
+- **Family weighting.** About 70% of the tasks need two or three dependent rounds (`kb_bridge` 900, `composite` 600,
+  `dual_bridge` 600, `chain_calc` 400, ...; single-call lookups 150 each). GRPO learns from differences *within* a
+  group of 8 rollouts. On families the SFT model already solves, every rollout gets the same reward and the group
+  contributes nothing, so an even split wastes most of the rollout budget.
 - 100% in-domain. TRL's `GRPOTrainer` takes one fixed tool list, so per-example schemas (as in ToolACE) cannot be mixed in.
 - Knowledge base: about 83k paragraphs from HotpotQA (distractor setting) behind BM25. HotpotQA ships gold supporting
   paragraphs, so "was the evidence retrieved" can be checked by program.
@@ -84,17 +96,24 @@ Two benchmarks, because they answer different questions.
   needs a paid search key).
 - All checkpoints are evaluated in non-thinking mode through one registered model id, so the comparison is like for like.
 
-**PlannerQA-Bench** (this repository; 800 held-out tasks, 100 per family)
+**PlannerQA-Bench** (this repository; 800 held-out tasks, ten families)
 
-| Family | Tests |
-|---|---|
-| `kb_bridge` | Multi-hop, query rewriting |
-| `kb_compare` | Decomposition, fan-out, synthesis |
-| `weather_lookup`, `election_lookup` | Tool selection, arguments, explicit date / year |
-| `fanout_calc` | Parallel lookups, then `calculator` |
-| `tool_bridge` | Cross-tool multi-hop |
-| `composite` | Two-part questions |
-| `no_tool` | Restraint: answer without calling anything |
+The mix is deliberately weighted towards multi-step tasks: 600 of the 800 need two or three *dependent* tool rounds.
+Single-call families are near their ceiling after SFT, so an evenly weighted benchmark would hide the differences
+that matter. The headline number is the **multi-step good rate** (good rate on tasks needing at least two rounds),
+and the report also breaks the good rate down by rounds needed (0, 1, 2, 3).
+
+| Family | Tasks | Rounds needed | Tests |
+|---|---|---|---|
+| `kb_bridge` | 150 | 2 | Multi-hop search, query rewriting |
+| `tool_bridge` | 100 | 2 | Cross-tool multi-hop (election -> weather) |
+| `fanout_calc` | 100 | 2 | Parallel lookups, then `calculator` |
+| `chain_calc` | 100 | 3 | Two elections -> two weather lookups -> `calculator` |
+| `dual_bridge` | 100 | 2 | A search bridge and a tool bridge interleaved in one question |
+| `composite` | 100 | 1 or 2 | Two-part questions |
+| `kb_compare` | 50 | 1 | Decomposition, fan-out, synthesis |
+| `weather_lookup`, `election_lookup` | 25 + 25 | 1 | Tool selection, arguments, explicit date / year |
+| `no_tool` | 50 | 0 | Restraint: answer without calling anything |
 
 Scoring:
 - Two axes, 1 to 4 each; the final score is the **minimum**; 3 and 4 count as good. This follows the structure of the
@@ -177,7 +196,7 @@ by data, not a matter of principle.
 
 ## 9. Engineering
 
-- Logic lives in the `planner/` package with 130 CPU unit tests; the notebooks are thin.
+- Logic lives in the `planner/` package with 136 CPU unit tests; the notebooks are thin.
 - Checkpoints, data, and every finished evaluation stage are on Google Drive. After a disconnect, *Run all* skips
   finished stages, resumes the trainer and continues the same W&B run.
 - Each checkpoint is pushed as three Hub repositories: adapter, merged 16-bit weights, GGUF.
@@ -186,7 +205,10 @@ by data, not a matter of principle.
 
 ---
 
-## 10. Results so far (SMOKE run only)
+## 10. Results so far (SMOKE run only, first benchmark version)
+
+These numbers are from the first benchmark version (eight evenly weighted families, no teacher data). They are kept
+as a record that the pipeline runs; the current benchmark is harder and has not been run yet.
 
 48 held-out tasks (6 per family), 12 SFT steps, 4 GRPO steps. One task is about 2 percentage points.
 
@@ -244,10 +266,27 @@ Disjoint HotpotQA splits, disjoint synthetic regions, fixed seeds, and BFCL is n
 Deterministic, fast, no GPU, and good enough to make query rewriting matter. The learned rewriting strategy is specific
 to this retriever, which is a limitation.
 
+**Why did you change the benchmark mix? Is that moving the goalposts?**
+The first smoke run showed the single-call families at or near 100% after SFT. A benchmark that is 50% solved tasks
+cannot separate SFT from RL. The task families and the scorer are unchanged; what changed is the weighting, plus two
+harder families. Results from the two versions are kept in separate folders and are not compared with each other.
+
+**Is SFT or RL better for multi-step queries?**
+They do different jobs. Where the plan can be written down in advance (`tool_bridge`, `fanout_calc`, `chain_calc`),
+imitation is enough and cheap. Where the next step depends on what the retriever returned (`kb_bridge`,
+`dual_bridge`), demonstrations are capped by whoever produced them, and RL is the only stage that can exceed them.
+The strategy is therefore: raise the demonstration ceiling with a teacher, then spend RL rollouts on the families
+that still fail.
+
+**Why Qwen3-14B as the teacher and not a frontier API model?**
+It needs no API key, runs on the same A100, and shares the chat template and tool-call format with the student. Any
+OpenAI-compatible endpoint can be plugged in instead (`TEACHER_ENDPOINT`). Quality is protected by the scorer, not by
+trusting the teacher.
+
 **What would you do next?**
 1. The full run, with a `binary` vs `graded` vs `graded_cost` reward ablation.
 2. A KL ablation if BFCL regresses.
-3. Rejection sampling with a stronger teacher, seeded from the failure tags, to improve the SFT data.
+3. An ablation of the teacher data (`TEACHER = False`) and of the GRPO family weighting, to show what each adds.
 4. Validate the rule-based score against the real autograder on a sample.
 
 ---

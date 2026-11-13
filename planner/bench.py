@@ -14,12 +14,12 @@ from collections import Counter, defaultdict
 from typing import Callable, Sequence
 
 from .scoring import TAGS, Score, score_messages
-from .tasks import FAMILIES, build_prompt
+from .tasks import FAMILIES, build_prompt, required_rounds
 from .tools import MAX_CALLS_PER_ROUND, MAX_TOOL_ROUNDS, TOOL_COSTS, execute_tool
 from .trace import parse_assistant_text
 
 Backend = Callable[[list[list[dict]]], list[dict]]
-FANOUT_FAMILIES = ("kb_compare", "fanout_calc", "composite")
+FANOUT_FAMILIES = ("kb_compare", "fanout_calc", "composite", "chain_calc", "dual_bridge")
 # Hard stop on calls executed in one round, so a runaway turn cannot flood the tools.
 EXECUTION_CAP = 2 * MAX_CALLS_PER_ROUND
 
@@ -119,8 +119,16 @@ def evaluate(tasks: Sequence[dict], completions: Sequence[list[dict]], keep_reco
     for s in scores:
         calls.update(s.calls_by_tool)
 
+    by_rounds: dict[int, list[Score]] = defaultdict(list)
+    for t, s in zip(tasks, scores):
+        by_rounds[required_rounds(t)].append(s)
+    multi_step = [s for r, group in by_rounds.items() if r >= 2 for s in group]
+
     report = {
         "summary": _summarise(scores),
+        # Tasks whose cheapest correct plan needs two or three dependent tool rounds: the headline number.
+        "multi_step": _summarise(multi_step),
+        "per_required_rounds": {str(r): _summarise(by_rounds[r]) for r in sorted(by_rounds)},
         "per_family": {f: _summarise(by_family[f]) for f in FAMILIES if by_family.get(f)},
         # Share of all tasks that failed with each tag (a rollout can carry several).
         "failure_tags": {tag: tag_counts.get(tag, 0) / max(1, len(scores)) for tag in TAGS},
@@ -157,6 +165,9 @@ def format_report(reports: dict[str, dict]) -> str:
     ]
     for label, key, fmt in rows:
         lines.append(f"| {label} | " + " | ".join(fmt.format(reports[n]["summary"].get(key, 0.0)) for n in names) + " |")
+    if all("multi_step" in reports[n] for n in names):
+        cells = [f"{reports[n]['multi_step'].get('good_rate', float('nan')):.1%}" for n in names]
+        lines.insert(2, "| **multi-step good rate** (tasks needing 2-3 tool rounds) | " + " | ".join(cells) + " |")
     lines.append("| parallel rate on fan-out tasks | " + " | ".join(f"{reports[n]['parallel_rate_on_fanout']:.1%}" for n in names) + " |")
 
     lines += ["", "Good rate by task family:", "", "| family | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
@@ -164,6 +175,12 @@ def format_report(reports: dict[str, dict]) -> str:
         if any(family in reports[n]["per_family"] for n in names):
             cells = [f"{reports[n]['per_family'].get(family, {}).get('good_rate', float('nan')):.1%}" for n in names]
             lines.append(f"| {family} | " + " | ".join(cells) + " |")
+
+    if all("per_required_rounds" in reports[n] for n in names):
+        lines += ["", "Good rate by tool rounds the task needs:", "", "| rounds needed (tasks) | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
+        for r in sorted({r for n in names for r in reports[n]["per_required_rounds"]}):
+            groups = [reports[n]["per_required_rounds"].get(r, {}) for n in names]
+            lines.append(f"| {r} ({max(g.get('n', 0) for g in groups)}) | " + " | ".join(f"{g.get('good_rate', float('nan')):.1%}" for g in groups) + " |")
 
     lines += ["", "Failure tags (share of all tasks):", "", "| tag | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
     for tag in TAGS:

@@ -224,6 +224,8 @@ ENABLE_THINKING = False      # Qwen3-1.7B only: let the planner think before cal
 USE_DRIVE = True             # checkpoints and caches on Google Drive
 RESUME = True                # reuse finished stages and checkpoints found on Drive
 RUN_BFCL = True              # official BFCL evaluation (A100 / L4; installs vLLM into its own virtualenv)
+TEACHER = True               # a stronger model demonstrates the multi-hop tasks the scripted expert cannot solve
+TEACHER_ENDPOINT = None      # None: serve cfg.teacher_model here with vLLM. Or ("https://host/v1", "api-key") for your own endpoint
 WANDB_PROJECT = "tool-use-planner"
 PUSH_TO_HUB = True           # push adapter + merged model (+ GGUF) to your Hugging Face account
 HF_PRIVATE = False
@@ -259,6 +261,43 @@ BFCL = {"base": bfcl.run_stage(CACHE, "base", cfg, PERSIST, enabled=RUN_BFCL)}
 if BFCL["base"]: print(bfcl.format_table({"base": BFCL["base"]}))
 '''
         ),
+        md(
+            """
+## 3b. Teacher demonstrations by rejection sampling
+
+SFT on the scripted expert is capped by the expert: its fixed strategy solves only about 70% of the multi-hop search
+tasks (`kb_bridge`, `composite`, `dual_bridge`). For the tasks it fails, a stronger **teacher** model
+(`cfg.teacher_model`, Qwen3-14B by default) attempts the same task in the same environment, up to
+`cfg.teacher_samples` times. Each attempt is scored by the benchmark's own scorer and only rollouts with a perfect
+score are kept - the teacher supplies ideas, the scorer decides what counts as a demonstration.
+
+The teacher is served with vLLM and shut down again before the student is loaded. Its rollouts are cached on Drive.
+If this step fails, training continues with the expert's demonstrations only.
+"""
+        ),
+        code(
+            '''
+from planner.expert import build_expert_traces
+from planner.persist import read_jsonl, write_jsonl
+from planner.teacher import generate_teacher_traces, teacher_targets
+
+EXPERT = build_expert_traces(env.tasks["sft"])              # scripted expert, CPU only (no_tool replies come later)
+TEACHER_DATA = os.path.join(PERSIST, "teacher_traces.jsonl")
+TEACHER_TRACES = []
+if RESUME and os.path.exists(TEACHER_DATA):
+    TEACHER_TRACES = read_jsonl(TEACHER_DATA)
+elif TEACHER:
+    targets = teacher_targets(env.tasks["sft"], EXPERT)
+    print(f"scripted expert: {len(EXPERT)} perfect rollouts; {len(targets)} multi-hop tasks left for the teacher ({cfg.teacher_model})")
+    try:
+        TEACHER_TRACES, stats = generate_teacher_traces(targets, cfg.teacher_model, samples=cfg.teacher_samples, endpoint=TEACHER_ENDPOINT)
+        write_jsonl(TEACHER_DATA, TEACHER_TRACES)
+        print(stats)
+    except Exception as error:
+        print(f"Teacher step FAILED ({type(error).__name__}: {error}). Continuing with the scripted expert only; see /content/teacher_server.log")
+print(f"{len(TEACHER_TRACES)} teacher demonstrations")
+'''
+        ),
         md("## 4. Load the model\nUnsloth loads the base model in 16-bit and adds a LoRA (rank 32, all projection layers)."),
         code(
             BENCH_HELPERS
@@ -279,8 +318,12 @@ the model one format.
 
 ## 5. PlannerQA-Bench on the base model
 
-800 held-out tasks, 100 per family: `kb_bridge` (multi-hop), `kb_compare` (fan-out), `weather_lookup`,
-`election_lookup`, `fanout_calc`, `tool_bridge` (cross-tool multi-hop), `composite` (two-part asks), `no_tool`.
+800 held-out tasks in ten families, weighted towards the hard ones: three quarters need two or three *dependent*
+tool rounds. `kb_bridge` (multi-hop search), `tool_bridge` (election -> weather), `fanout_calc` (parallel lookups ->
+calculator), `chain_calc` (two elections -> two weather lookups -> calculator: three rounds), `dual_bridge` (a search
+bridge and a tool bridge interleaved in one ask), `composite` (two-part asks), and a smaller share of the
+single-round families `kb_compare`, `weather_lookup`, `election_lookup` and `no_tool`. The headline number is the
+**multi-step good rate**: the good rate on tasks that need at least two rounds.
 Each rollout gets two scores from 1 to 4 and the final score is their minimum (3 and 4 are "good"):
 
 - **relevance** - did the plan go after every part of the question, without off-topic calls?
@@ -300,17 +343,18 @@ print(format_report(BENCH))
 | source | role | share |
 |---|---|---|
 | ToolACE + Hermes function calling | general function calling: arbitrary schemas, parallel calls, declining to call | ~85% |
-| scripted expert in the mock environment | our tool set, the three-round protocol, the final `Answer:` line | ~15% |
+| scripted expert in the mock environment | our tool set, the three-round protocol, the final `Answer:` line | ~18% |
+| teacher rollouts that scored 4 (section 3b) | multi-hop tasks the expert could not solve | ~2% |
 
 The expert really runs the tools and only rollouts with a perfect score are kept. It is deliberately plain - it
-searches with the question, then with an entity it read about - so GRPO has room to improve on it.
+searches with the question, then with an entity it read about. The in-domain tasks lean towards the multi-step
+families (two thirds need two or three tool rounds).
 """
         ),
         code(
             '''
+from collections import Counter
 from planner.data_public import load_public_examples, render_examples
-from planner.expert import build_expert_traces
-from planner.persist import read_jsonl, write_jsonl
 
 SFT_DATA = os.path.join(PERSIST, "sft_train.jsonl")
 if RESUME and os.path.exists(SFT_DATA):
@@ -320,7 +364,8 @@ else:
     plain = hf_generate_fn(model, tokenizer, max_new_tokens=128, batch_size=cfg.bench_batch)
     def direct_answers(queries):                               # no_tool tasks: the base model's own tool-free reply
         return plain([fmt.render_prompt([{"role": "user", "content": q}], tools=None) for q in queries])
-    traces = build_expert_traces(env.tasks["sft"], direct_answer_fn=direct_answers)
+    traces = build_expert_traces(env.tasks["sft"], direct_answer_fn=direct_answers) + TEACHER_TRACES
+    print("in-domain demonstrations per family:", dict(Counter(t["family"] for t in traces)), "| from the teacher:", len(TEACHER_TRACES))
     public = load_public_examples(cfg.n_toolace, cfg.n_hermes, cfg.seed)
     examples = public + traces
     random.Random(cfg.seed).shuffle(examples)
@@ -546,6 +591,10 @@ R = g - 0.3 * min(1, excess_cost / 3) - 0.2 * invalid_fraction   # "graded_cost"
 `excess_cost` is the cost above the task's cheapest correct plan: necessary calls are free, redundant ones are not.
 Taking the minimum of the two axes means guessing an answer without evidence earns at most 1/3, and retrieving
 evidence without answering earns 0.
+
+The 4,000 training tasks are not spread evenly over the families (`cfg.grpo_mix`): about 70% need two or three
+dependent rounds. After SFT the single-call families get full reward on almost every rollout, so a group of eight
+rollouts has no variance and teaches nothing; the rollouts are spent where the policy still fails.
 """
         ),
         code(
@@ -698,7 +747,7 @@ display(Markdown(report))
 
 - **SFT** is expected to move BFCL and the simpler task families: it teaches formats, schemas and the tool inventory
   with dense per-token supervision.
-- **GRPO** is expected to move the hard families (`kb_bridge`, `tool_bridge`, `composite`) and the tool cost, because it
+- **GRPO** is expected to move the hard families (`kb_bridge`, `dual_bridge`, `composite`) and the tool cost, because it
   trains on the states the model itself reaches and optimises the outcome directly. On BFCL it should hold steady: the
   GRPO environment has a fixed tool set, so BFCL here is a check that general function calling was not lost.
 - The failure-tag table shows which error types each stage removed.

@@ -53,7 +53,7 @@ def to_openai_messages(messages: list[dict]) -> list[dict]:
 class OpenAIBackend:
     """Backend for `bench.run_rollouts` that talks to an OpenAI-compatible chat endpoint."""
 
-    def __init__(self, base_url: str, api_key: str = "EMPTY", model: str | None = None, temperature: float = 0.0, max_tokens: int = 512, client=None):
+    def __init__(self, base_url: str, api_key: str = "EMPTY", model: str | None = None, temperature: float = 0.0, max_tokens: int = 512, client=None, extra_body: dict | None = None):
         if client is None:
             from openai import OpenAI
 
@@ -62,6 +62,7 @@ class OpenAIBackend:
         self.model = model or self._first_model()
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.extra_body = extra_body  # e.g. {"chat_template_kwargs": {"enable_thinking": False}} for vLLM
 
     def _first_model(self) -> str:
         return self.client.models.list().data[0].id
@@ -75,6 +76,7 @@ class OpenAIBackend:
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             stream=False,  # required behind a Cloudflare quick tunnel
+            **({"extra_body": self.extra_body} if self.extra_body else {}),
         )
         message = response.choices[0].message
         content = message.content or ""

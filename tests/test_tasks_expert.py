@@ -1,6 +1,8 @@
 import json
 import random
 
+import pytest
+
 from planner import tasks as T
 from planner.config import get_config
 from planner.expert import build_expert_traces, expert_rollout
@@ -66,7 +68,7 @@ def test_build_split_and_pools(world, corpus, rows):
 
 def test_expert_solves_every_family(world, corpus, rows):
     items = T.kb_items(rows, corpus)
-    tasks = T.build_split("sft", 3, world, items * 2, seed=3)
+    tasks = T.build_split("sft", 3, world, items * 4, seed=3)
     solved = set()
     for task in tasks:
         rollout = expert_rollout(task)
@@ -75,7 +77,7 @@ def test_expert_solves_every_family(world, corpus, rows):
             assert score.good, (task["family"], task["query"], score)
             if score.score == 4:
                 solved.add(task["family"])
-    assert solved >= {"kb_bridge", "kb_compare", "weather_lookup", "election_lookup", "fanout_calc", "tool_bridge"}
+    assert solved >= {"kb_bridge", "kb_compare", "weather_lookup", "election_lookup", "fanout_calc", "tool_bridge", "chain_calc", "dual_bridge"}
 
 
 def test_expert_bridge_searches_with_what_it_read(world, corpus, rows):
@@ -117,6 +119,8 @@ def test_prepare_caches_environment(tmp_path, monkeypatch, rows):
     first = prepare(config, str(tmp_path), verbose=False)
     second = prepare(config, str(tmp_path), verbose=False)
     assert calls == [(config.hotpot_train_rows, config.hotpot_val_rows)]  # second call used the cache
+    changed = prepare(get_config("smoke", n_eval_per_family=2, n_grpo_per_family=2, n_sft_per_family=2, eval_mix={"weather_lookup": 2.0}), str(tmp_path), verbose=False)
+    assert len(calls) == 2 and changed.tasks["eval"] != first.tasks["eval"]  # other task settings: the cache is rebuilt
     assert first.tasks == second.tasks and len(second.corpus) == len(first.corpus)
     assert set(first.tasks) == {"sft", "grpo", "eval"}
 
@@ -129,3 +133,38 @@ def test_grpo_rows_carry_prompt_and_task(world):
     for row in rows:
         task = json.loads(row["task"])
         assert [m["role"] for m in row["prompt"]] == ["system", "user"] and row["prompt"][1]["content"] == task["query"]
+
+
+def test_family_mix_shifts_a_split_towards_multi_step(world, corpus, rows):
+    assert T.family_sizes(100, {"kb_bridge": 1.5, "no_tool": 0.5})["kb_bridge"] == 150
+    assert T.family_sizes(100, {"no_tool": 0.5})["no_tool"] == 50 and T.family_sizes(100)["chain_calc"] == 100
+    with pytest.raises(ValueError):
+        T.family_sizes(10, {"not_a_family": 2})
+    tasks = T.build_split("eval", 4, world, T.kb_items(rows, corpus) * 3, seed=1, mix={"weather_lookup": 0.25, "chain_calc": 2.0})
+    counts = T.family_counts(tasks)
+    assert counts["weather_lookup"] == 1 and counts["chain_calc"] == 8 and counts["tool_bridge"] == 4
+    config = get_config("a100")
+    sizes = T.family_sizes(config.n_eval_per_family, config.eval_mix)
+    assert sum(sizes.values()) == 800 and sum(T.family_sizes(config.n_grpo_per_family, config.grpo_mix).values()) == 4000
+    multi = sum(sizes[f] for f in T.MULTI_STEP_FAMILIES) + sizes["composite"] // 2
+    assert multi / 800 >= 0.7  # the benchmark is mostly multi-step
+
+
+def test_three_step_and_dual_bridge_tasks(world, corpus, rows):
+    import random
+
+    rng = random.Random(5)
+    for _ in range(20):
+        task = T._finish(T.make_chain_calc(rng, world, "eval"), "chain_calc", "eval", 0)
+        plan = task["optimal_plan"]
+        assert T.required_rounds(task) == 3 and [c["tool"] for c in plan[0]] == ["get_election"] * 2
+        assert [c["tool"] for c in plan[1]] == ["get_weather"] * 2 and plan[2][0]["tool"] == "calculator"
+        assert score_messages(task, expert_rollout(task)).score == 4
+        # stopping after the first two rounds is a multi-hop failure, not a good answer
+        first_round_only = expert_rollout(task)[:3] + [{"role": "assistant", "content": "Answer: 123456"}]
+        score = score_messages(task, first_round_only)
+        assert not score.good and "multi_hop_incomplete" in score.tags
+    bridge = next(i for i in T.kb_items(rows, corpus) if i["type"] == "bridge")
+    dual = T._finish(T.make_dual_bridge(rng, world, "eval", bridge), "dual_bridge", "eval", 0)
+    assert T.required_rounds(dual) == 2 and len(dual["aspects"]) == 2 and all(a["multi_hop"] for a in dual["aspects"])
+    assert {c["tool"] for c in dual["optimal_plan"][1]} == {"knowledge_search", "get_weather"}

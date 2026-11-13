@@ -33,8 +33,12 @@ FAMILIES = (
     "fanout_calc",
     "tool_bridge",
     "composite",
+    "chain_calc",
+    "dual_bridge",
     "no_tool",
 )
+# Families whose cheapest plan needs at least two rounds in every task (composite: only in its bridge half).
+MULTI_STEP_FAMILIES = ("kb_bridge", "fanout_calc", "tool_bridge", "chain_calc", "dual_bridge")
 
 SYSTEM_PROMPT = """You are a planner that answers questions by calling tools.
 
@@ -394,6 +398,60 @@ def kb_items(rows: list[dict], corpus: Corpus, check_retrievable: bool = True) -
     return items
 
 
+# ---------------------------------------------------------------- chain_calc
+def make_chain_calc(rng: random.Random, world: World, split: str) -> dict:
+    """Three dependent rounds: two elections -> the weather on both election days -> a calculation."""
+    kind = rng.choice(["temp_diff_years", "temp_diff_regions", "precip_total_years"])
+    if kind == "temp_diff_regions":
+        r1, r2 = rng.sample(world.region_list(split), 2)
+        year = rng.choice(ELECTION_YEARS)
+        hops1 = [call("get_election", region=r.name, year=year) for r in (r1, r2)]
+    else:
+        region = rng.choice(world.region_list(split))
+        y1, y2 = sorted(rng.sample(list(ELECTION_YEARS), 2))
+        hops1 = [call("get_election", region=region.name, year=y) for y in (y1, y2)]
+    elections = [world.election(**h["args"]) for h in hops1]
+    hops2 = [call("get_weather", city=e["capital"], date=e["election_date"]) for e in elections]
+    attr = "precip_mm" if kind == "precip_total_years" else "temp_c"
+    v1, v2 = (world.weather(**h["args"])[attr] for h in hops2)
+    if kind == "precip_total_years":
+        expression, value = f"{v1} + {v2}", round(v1 + v2, 2)
+        query = _pick(
+            rng,
+            ["Add up the precipitation that fell in the capital of {region} on its {y1} election day and on its {y2} election day."],
+            ["How many millimetres of precipitation did {region}'s capital get in total across its {y1} and {y2} election days?"],
+            split,
+        ).format(region=region.name, y1=y1, y2=y2)
+    else:
+        expression, value = f"abs({v1} - {v2})", round(abs(v1 - v2), 2)
+        if kind == "temp_diff_years":
+            query = _pick(
+                rng,
+                [
+                    "What was the temperature difference in the capital of {region} between its {y1} election day and its {y2} election day?",
+                    "By how many degrees did the temperature in {region}'s capital differ between the day of the {y1} election and the day of the {y2} election?",
+                ],
+                ["Take the {y1} and {y2} election days in {region}: how far apart, in degrees Celsius, were the temperatures in its capital?"],
+                split,
+            ).format(region=region.name, y1=y1, y2=y2)
+        else:
+            query = _pick(
+                rng,
+                ["On the days of their {year} elections, what was the temperature difference between the capital of {a} and the capital of {b}?"],
+                ["Each of {a} and {b} voted in {year}. How many degrees apart were their capitals' temperatures on their respective election days?"],
+                split,
+            ).format(a=r1.name, b=r2.name, year=year)
+    aspect = {
+        "name": f"chain:{kind}",
+        "answers": [str(value)],
+        "answer_type": "number",
+        "evidence": [{"type": "call", **h} for h in hops1 + hops2] + [{"type": "calc", "value": value}],
+        "multi_hop": True,
+        "constraint_args": ["year", "date"],
+    }
+    return {"query": query, "aspects": [aspect], "optimal_plan": [hops1, hops2, [call("calculator", expression=expression)]]}
+
+
 def _kb_part(item: dict) -> dict:
     searches = [call("knowledge_search", query=t) for t in item["titles"]]
     bridge = item["type"] == "bridge"
@@ -443,12 +501,35 @@ def make_composite(rng: random.Random, world: World, split: str, item: dict) -> 
     }
 
 
+_DUAL_JOIN = [
+    "{kb} Also, {tool_lc}",
+    "Two questions. First: {tool} Second: {kb}",
+]
+_DUAL_JOIN_EVAL = ["I need two things answered. {kb} In addition, {tool_lc}"]
+
+
+def make_dual_bridge(rng: random.Random, world: World, split: str, item: dict) -> dict:
+    """Two multi-hop chains in one ask: a knowledge bridge and an election -> weather bridge, interleaved."""
+    tool_task = make_tool_bridge(rng, world, split)
+    kb_part = _kb_part(item)
+    tool_q = tool_task["query"]
+    query = _pick(rng, _DUAL_JOIN, _DUAL_JOIN_EVAL, split).format(kb=kb_part["question"], tool=tool_q, tool_lc=_lower_first(tool_q))
+    plan = [kb_round + tool_round for kb_round, tool_round in zip(kb_part["plan"], tool_task["optimal_plan"])]
+    return {
+        "query": query,
+        "aspects": [kb_part["aspect"], tool_task["aspects"][0]],
+        "optimal_plan": plan,
+        "meta": {"hotpot_id": item["id"], "kb_question": kb_part["question"]},
+    }
+
+
 # ----------------------------------------------------------------- assembly
 _SYNTHETIC: dict[str, Callable[[random.Random, World, str], dict]] = {
     "weather_lookup": make_weather_lookup,
     "election_lookup": make_election_lookup,
     "fanout_calc": make_fanout_calc,
     "tool_bridge": make_tool_bridge,
+    "chain_calc": make_chain_calc,
     "no_tool": make_no_tool,
 }
 
@@ -464,19 +545,33 @@ def _finish(task: dict, family: str, split: str, index: int) -> dict:
     return task
 
 
+def family_sizes(n_per_family: int | dict, mix: dict | None = None) -> dict[str, int]:
+    """Tasks per family: a base size times an optional per-family multiplier, e.g. {"kb_bridge": 2.0}."""
+    if isinstance(n_per_family, dict):
+        return {f: int(n_per_family.get(f, 0)) for f in FAMILIES}
+    unknown = set(mix or {}) - set(FAMILIES)
+    if unknown:
+        raise ValueError(f"unknown task families in mix: {sorted(unknown)}")
+    return {f: int(round(n_per_family * (mix or {}).get(f, 1.0))) for f in FAMILIES}
+
+
 def build_split(
     split: str,
-    n_per_family: int,
+    n_per_family: int | dict,
     world: World,
     kb_pool: list[dict],
     seed: int,
+    mix: dict | None = None,
 ) -> list[dict]:
-    """Build `n_per_family` tasks of each family for one split ("sft", "grpo" or "eval").
+    """Build the tasks of one split ("sft", "grpo" or "eval").
 
-    `kb_pool` are the HotpotQA items reserved for this split. They are divided
-    between kb_bridge, kb_compare and composite without overlap. If the pool is
-    too small for a family, that family simply gets fewer tasks.
+    `n_per_family` tasks per family, scaled per family by `mix` (see
+    `family_sizes`). `kb_pool` are the HotpotQA items reserved for this split.
+    They are divided between kb_bridge, kb_compare, composite and dual_bridge
+    without overlap. If the pool is too small for a family, that family simply
+    gets fewer tasks.
     """
+    sizes = family_sizes(n_per_family, mix)
     world_split = "eval" if split == "eval" else "train"
     tasks: list[dict] = []
     seen: set[str] = set()
@@ -484,7 +579,7 @@ def build_split(
     for family, maker in _SYNTHETIC.items():
         rng = random.Random(f"{seed}|{split}|{family}")
         made, attempts = 0, 0
-        while made < n_per_family and attempts < n_per_family * 50:
+        while made < sizes[family] and attempts < sizes[family] * 50:
             attempts += 1
             task = maker(rng, world, world_split)
             if task["query"] in seen:
@@ -498,19 +593,29 @@ def build_split(
     rng.shuffle(pool)
     bridge = [i for i in pool if i["type"] == "bridge"]
     compare = [i for i in pool if i["type"] == "comparison"]
-    take_compare, compare = compare[:n_per_family], compare[n_per_family:]
-    take_bridge, bridge = bridge[:n_per_family], bridge[n_per_family:]
+    take_compare, compare = compare[: sizes["kb_compare"]], compare[sizes["kb_compare"] :]
+    take_bridge, bridge = bridge[: sizes["kb_bridge"]], bridge[sizes["kb_bridge"] :]
     for i, item in enumerate(take_bridge):
         tasks.append(_finish(make_kb_task(item), "kb_bridge", split, i))
     for i, item in enumerate(take_compare):
         tasks.append(_finish(make_kb_task(item), "kb_compare", split, i))
     # Composite: half comparison (one parallel round), half bridge (two rounds), as available.
-    half = n_per_family // 2
-    comp_items = compare[:half] + bridge[: n_per_family - min(half, len(compare))]
+    n = sizes["composite"]
+    n_compare = min(n // 2, len(compare))
+    comp_items = compare[:n_compare] + bridge[: n - n_compare]
+    bridge = bridge[n - n_compare :]
     rng_c = random.Random(f"{seed}|{split}|composite")
-    for i, item in enumerate(comp_items[:n_per_family]):
+    for i, item in enumerate(comp_items):
         tasks.append(_finish(make_composite(rng_c, world, world_split, item), "composite", split, i))
+    rng_d = random.Random(f"{seed}|{split}|dual_bridge")
+    for i, item in enumerate(bridge[: sizes["dual_bridge"]]):
+        tasks.append(_finish(make_dual_bridge(rng_d, world, world_split, item), "dual_bridge", split, i))
     return tasks
+
+
+def required_rounds(task: dict) -> int:
+    """Tool rounds in the task's cheapest correct plan (0 for no_tool)."""
+    return len(task.get("optimal_plan") or [])
 
 
 def split_kb_pools(train_items: list[dict], val_items: list[dict]) -> dict[str, list[dict]]:

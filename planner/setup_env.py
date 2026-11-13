@@ -6,6 +6,7 @@ restarted notebook gets byte-identical tasks without re-downloading HotpotQA.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 
@@ -15,6 +16,9 @@ from .config import Config, get_config
 from .corpus import Corpus, load_hotpot_rows
 from .persist import read_jsonl, write_jsonl
 from .world import World
+
+
+_ENV_KEYS = ("seed", "hotpot_train_rows", "hotpot_val_rows", "n_eval_per_family", "n_grpo_per_family", "n_sft_per_family", "eval_mix", "grpo_mix", "sft_mix", "task_version")
 
 
 @dataclass
@@ -67,7 +71,16 @@ def prepare(config: Config, cache_dir: str, verbose: bool = True) -> PlannerEnv:
     task_paths = {split: os.path.join(cache_dir, f"tasks_{split}.jsonl") for split in ("sft", "grpo", "eval")}
     world = World(seed=config.seed)
 
-    if os.path.exists(corpus_path) and all(os.path.exists(p) for p in task_paths.values()):
+    # The cache is only valid for the task settings it was built with.
+    key = {k: v for k, v in config.fingerprint().items() if k in _ENV_KEYS}
+    key_path = os.path.join(cache_dir, "env_config.json")
+    cached = os.path.exists(corpus_path) and all(os.path.exists(p) for p in task_paths.values())
+    if cached and (not os.path.exists(key_path) or json.load(open(key_path)) != json.loads(json.dumps(key))):
+        cached = False
+        if verbose:
+            print(f"The cached environment in {cache_dir} was built with other task settings: rebuilding it")
+
+    if cached:
         corpus = Corpus.load(corpus_path)
         tasks = {split: read_jsonl(path) for split, path in task_paths.items()}
         if verbose:
@@ -76,11 +89,17 @@ def prepare(config: Config, cache_dir: str, verbose: bool = True) -> PlannerEnv:
         corpus, train_rows, val_rows = _build_corpus(config.hotpot_train_rows, config.hotpot_val_rows, verbose)
         tools.configure(world=world, corpus=corpus)
         pools = T.split_kb_pools(T.kb_items(train_rows, corpus), T.kb_items(val_rows, corpus))
-        sizes = {"sft": config.n_sft_per_family, "grpo": config.n_grpo_per_family, "eval": config.n_eval_per_family}
-        tasks = {split: T.build_split(split, n, world, pools[split], config.seed) for split, n in sizes.items()}
+        sizes = {
+            "sft": (config.n_sft_per_family, config.sft_mix),
+            "grpo": (config.n_grpo_per_family, config.grpo_mix),
+            "eval": (config.n_eval_per_family, config.eval_mix),
+        }
+        tasks = {split: T.build_split(split, n, world, pools[split], config.seed, mix=mix) for split, (n, mix) in sizes.items()}
         corpus.save(corpus_path)
         for split, path in task_paths.items():
             write_jsonl(path, tasks[split])
+        with open(key_path, "w") as f:
+            json.dump(key, f)
 
     tools.configure(world=world, corpus=corpus)
     if verbose:

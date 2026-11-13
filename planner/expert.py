@@ -40,26 +40,36 @@ def _search(query: str) -> dict:
     return {"tool": "knowledge_search", "args": {"query": query}}
 
 
-def _kb_rounds(aspect: dict, question: str, first_round_extra: list[dict], out: list[dict]) -> bool:
+def _kb_rounds(aspect: dict, question: str, extra_rounds: list[list[dict]], out: list[dict]) -> bool:
     """Search for the two gold passages of a HotpotQA aspect the way a careful user would.
 
-    Returns False when this plain strategy does not find them (no demonstration).
+    `extra_rounds[i]` are the non-search calls of the task that belong in round
+    i (the specialised-tool part of a composite or dual_bridge task); they ride
+    along with the searches. Returns False when this plain strategy does not
+    find the passages (no demonstration).
     """
     docs = [i for i in aspect["evidence"] if i["type"] == "doc"]
     titles = [d["title"] for d in docs]
     gold = {d["doc_id"]: d["title"] for d in docs}
     in_question = [t for t in titles if t.lower() in question.lower()]
+    extras = [list(r) for r in extra_rounds] + [[]]
+
+    def finish(rounds_used: int) -> bool:
+        for calls in extras[rounds_used:]:
+            if calls:
+                _run_round(calls, out)
+        return True
 
     if not aspect.get("multi_hop") and len(in_question) == len(titles):
         # Comparison: both entities are named in the question -> fan out in one round.
-        _run_round([_search(t) for t in titles] + first_round_extra, out)
-        return True
+        _run_round([_search(t) for t in titles] + extras[0], out)
+        return finish(1)
 
     # Otherwise start from the question itself.
-    results = _run_round([_search(question)] + first_round_extra, out)[0]
+    results = _run_round([_search(question)] + extras[0], out)[0]
     found = {p["doc_id"]: p for p in results if isinstance(p, dict) and p.get("doc_id") in gold} if isinstance(results, list) else {}
     if len(found) == len(gold):
-        return True
+        return finish(1)
     if not found:
         return False
     # Second hop: the missing entity must be visible in what we just read (or in the question).
@@ -67,8 +77,8 @@ def _kb_rounds(aspect: dict, question: str, first_round_extra: list[dict], out: 
     seen_text = " ".join(f"{p['title']} {p['text']}" for p in found.values()).lower()
     if missing_title.lower() not in seen_text and missing_title.lower() not in question.lower():
         return False
-    _run_round([_search(missing_title)], out)
-    return True
+    _run_round([_search(missing_title)] + (extras[1] if len(extras) > 1 else []), out)
+    return finish(2)
 
 
 def expert_rollout(task: dict) -> list[dict] | None:
@@ -79,8 +89,8 @@ def expert_rollout(task: dict) -> list[dict] | None:
         return None  # no_tool answers are free text: see `build_expert_traces`
     kb = [a for a in aspects if any(i["type"] == "doc" for i in a["evidence"])]
     if kb:
-        # First-round calls that do not belong to the knowledge aspect (composite tasks).
-        extra = [c for c in task["optimal_plan"][0] if c["tool"] != "knowledge_search"]
+        # Calls that do not belong to the knowledge aspect (composite, dual_bridge), round by round.
+        extra = [[c for c in calls if c["tool"] != "knowledge_search"] for calls in task["optimal_plan"]]
         question = task["query"] if len(aspects) == 1 else _kb_question(task)
         if question is None or not _kb_rounds(kb[0], question, extra, out):
             return None

@@ -146,3 +146,21 @@ def test_hf_generate_fn_retries_oom_in_halves():
     assert out == ["ok"] * 8
     assert model.sizes == [8, 4, 2, 2, 4, 2, 2]  # 8 -> 4+4 -> 2+2 each, until it fits
     assert tok.padding_side == "right"
+
+
+def test_report_has_a_multi_step_headline(world):
+    rng = random.Random(3)
+    easy = [T._finish(T.make_weather_lookup(rng, world, "eval"), "weather_lookup", "eval", i) for i in range(2)]
+    hard = [T._finish(T.make_chain_calc(rng, world, "eval"), "chain_calc", "eval", i) for i in range(2)]
+
+    def solve(task, rounds):
+        plan = [[(c["tool"], c["args"]) for c in calls] for calls in task["optimal_plan"][:rounds]]
+        return run(*plan, final="Answer: " + (task["aspects"][0]["answers"][0] if rounds == len(task["optimal_plan"]) else "123456"))
+
+    completions = [solve(t, 1) for t in easy] + [solve(hard[0], 3), solve(hard[1], 1)]
+    report = evaluate(easy + hard, completions)
+    assert report["summary"]["good_rate"] == 0.75
+    assert report["multi_step"]["n"] == 2 and report["multi_step"]["good_rate"] == 0.5
+    assert report["per_required_rounds"]["1"]["good_rate"] == 1.0 and report["per_required_rounds"]["3"]["n"] == 2
+    text = format_report({"base": report})
+    assert "multi-step good rate" in text and "| 3 (2) | 50.0% |" in text

@@ -35,8 +35,14 @@ class Endpoint:
     log_path: str | None = None
 
     def stop(self) -> None:
+        """Stop the server and wait until it is gone, so its GPU memory is free for whatever comes next."""
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
+            try:
+                self.process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
 
 
 def first_existing_repo(candidates: list[str], exists=None) -> str:
@@ -104,10 +110,10 @@ def start_unsloth(name: str, gguf_repo: str, port: int, log_path: str, variant: 
     return Endpoint(name=name, base_url=f"http://127.0.0.1:{port}/v1", api_key="", process=process, log_path=log_path)
 
 
-def start_vllm(name: str, model: str, port: int, log_path: str, gpu_memory_utilization: float = 0.28, max_model_len: int = 8192) -> Endpoint:
-    """vLLM chat server for merged weights (a Hub repo id or a local directory)."""
+def start_vllm(name: str, model: str, port: int, log_path: str, gpu_memory_utilization: float = 0.28, max_model_len: int = 8192, python: str | None = None) -> Endpoint:
+    """vLLM chat server for a Hub repo id or a local directory, run by `python` (default: this environment)."""
     command = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        python or sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", model,
         "--served-model-name", name,
         "--port", str(port),

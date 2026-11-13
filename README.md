@@ -51,17 +51,24 @@ calls, irrelevance, multi-turn. It is evaluation only. We run the offline catego
 four official groups and their mean, *BFCL-core*. The agentic group is not run, so BFCL-core is not the leaderboard's
 overall score.
 
-**PlannerQA-Bench** (this repository) measures planning with our tools. 800 held-out tasks, 100 per family:
+**PlannerQA-Bench** (this repository) measures planning with our tools: 800 held-out tasks in ten families. The mix
+leans on purpose towards the hard families - three quarters of the tasks need two or three *dependent* tool rounds -
+because single-call tasks are close to their ceiling after SFT and say little about planning.
 
-| family | tests | cheapest correct plan |
-|---|---|---|
-| `kb_bridge` | multi-hop, query rewriting | search, then search with an entity from the first result |
-| `kb_compare` | decomposition, fan-out, synthesis | two searches in one round |
-| `weather_lookup` / `election_lookup` | tool selection, arguments, explicit date / year | one specialised call |
-| `fanout_calc` | fan-out over cities or dates, then synthesis | parallel lookups, then `calculator` |
-| `tool_bridge` | cross-tool multi-hop | `get_election`, then `get_weather(capital, election date)` |
-| `composite` | two-part asks | specialised call and search in parallel, maybe one more search |
-| `no_tool` | restraint | answer directly |
+| family | tasks | tests | cheapest correct plan |
+|---|---|---|---|
+| `kb_bridge` | 150 | multi-hop, query rewriting | search, then search with an entity from the first result |
+| `tool_bridge` | 100 | cross-tool multi-hop | `get_election`, then `get_weather(capital, election date)` |
+| `fanout_calc` | 100 | fan-out over cities or dates, then synthesis | parallel lookups, then `calculator` |
+| `chain_calc` | 100 | three dependent rounds | two `get_election`, then two `get_weather`, then `calculator` |
+| `dual_bridge` | 100 | two interleaved multi-hop chains in one ask | search + `get_election`, then search + `get_weather` |
+| `composite` | 100 | two-part asks | specialised call and search in parallel, maybe one more search |
+| `kb_compare` | 50 | decomposition, fan-out, synthesis | two searches in one round |
+| `weather_lookup` / `election_lookup` | 25 + 25 | tool selection, arguments, explicit date / year | one specialised call |
+| `no_tool` | 50 | restraint | answer directly |
+
+The headline number is the **multi-step good rate**: the good rate on the tasks whose cheapest plan needs at least two
+rounds (600 of the 800). The report also breaks the good rate down by the number of rounds a task needs (0 to 3).
 
 Each rollout is scored on two axes from 1 to 4 and the final score is the minimum; 3 and 4 count as good.
 
@@ -74,17 +81,27 @@ Evidence is read only from tool messages, which Python writes. Bad rollouts are 
 training stage removed. The scoring is a rule-based approximation on synthetic, gold-labelled tasks; it is not an LLM
 autograder.
 
-For reference, the scripted expert used for SFT demonstrations scores 92% overall on the held-out set: 69% on
-`kb_bridge`, 89% on `kb_compare`, 78% on `composite`, 100% elsewhere.
+For reference, the scripted expert used for SFT demonstrations is perfect on the synthetic families and solves 69% of
+`kb_bridge`, 69% of `dual_bridge`, 78% of `composite` and 90% of `kb_compare` on the held-out set.
 
 ## Training
 
 **SFT** (`01_sft.ipynb`): about 10k ToolACE and 1.1k Hermes function-calling conversations for general function
-calling, plus about 1.9k in-domain demonstrations from the scripted expert (only rollouts with a perfect score are
-kept). Unsloth + TRL `SFTTrainer`, LoRA rank 32, loss on assistant turns only.
+calling, plus about 2.5k in-domain demonstrations. Those come from two sources:
+
+- a scripted expert that really runs the tools (only rollouts with a perfect score are kept). It is plain on purpose
+  and fails about 30% of the multi-hop search tasks;
+- for those failed tasks, a **teacher** (`Qwen/Qwen3-14B` by default, or any OpenAI-compatible endpoint) attempts the
+  task up to four times in the same environment, and rollouts that score 4 on both axes are added
+  (`planner/teacher.py`). This is rejection sampling: the teacher proposes, the benchmark's scorer disposes.
+
+Two thirds of the in-domain tasks need two or three tool rounds. Unsloth + TRL `SFTTrainer`, LoRA rank 32, loss on
+assistant turns only.
 
 **GRPO** (`02_grpo.ipynb`): TRL `GRPOTrainer` with native multi-round tool calling, as in Unsloth's
-*Qwen3 (4B) GRPO Tool Use* notebook. 4,000 training tasks, 8 rollouts per prompt, tool results masked out of the loss.
+*Qwen3 (4B) GRPO Tool Use* notebook. 4,000 training tasks, 8 rollouts per prompt, tool results masked out of the loss. The tasks are weighted towards
+the multi-step families (`grpo_mix` in `planner/config.py`, about 70% multi-step): groups whose rollouts all get full
+reward carry no learning signal, so rollouts are spent where the policy still fails.
 The reward is rule-based:
 
 ```
@@ -124,11 +141,12 @@ python -m planner.demo --base-url http://127.0.0.1:8888/v1 --api-key sk-unsloth-
 ```
 planner/
   tools.py, world.py, corpus.py   the four tools, the synthetic world, the BM25 knowledge base
-  tasks.py                        the eight task families, gold labels, cheapest plans
+  tasks.py                        the ten task families, gold labels, cheapest plans
   trace.py, scoring.py            rollout parsing; relevance / factuality scores and failure tags
   rewards.py                      GRPO reward functions and the tool-call ledger
   bench.py                        PlannerQA-Bench loop and report
-  expert.py, data_public.py       SFT data: scripted expert, ToolACE / Hermes converters
+  expert.py, teacher.py           SFT data: scripted expert; teacher rollouts kept by rejection sampling
+  data_public.py                  SFT data: ToolACE / Hermes converters
   chat.py                         one chat template for SFT, GRPO, benchmark and serving
   bfcl.py, bfcl_handler.py        official BFCL in its own virtualenv; non-thinking Qwen3 handler
   persist.py, setup_env.py        Drive persistence, stage cache, environment build / cache
@@ -155,18 +173,24 @@ or network access to download the Qwen3 tokenizer skip themselves when those are
 
 ## What has and has not been verified
 
-Verified on CPU: all of the above tests; a full-size build of the environment (83k passages, 2,000 / 4,000 / 800
+Verified on CPU: all of the above tests; a full-size build of the environment (83k passages, 2,850 / 4,000 / 800
 tasks, about one minute); conversion and rendering of the real ToolACE and Hermes data with the real Qwen3 tokenizer;
 the benchmark, reward and demo loops driven by the scripted expert; registration of the non-thinking BFCL handler with
 the real `bfcl-eval` package.
 
-A Colab A100 run of `01_sft.ipynb` got as far as the first benchmark and exposed the `bm25s` / JAX problem below and
-an install line that failed silently; both are fixed, but the fixed notebook has not been re-run on Colab yet.
+On a Colab A100, `01_sft.ipynb` and `02_grpo.ipynb` have run end to end in `SMOKE` mode (BFCL through vLLM, SFT, GRPO
+with the vLLM engine, merged and GGUF export, Hub push). That was with the first version of the benchmark (eight
+evenly weighted families); the outputs saved in those notebooks are from that run.
 
-Not verified, because it needs a GPU and Colab: the training runs themselves and any resulting scores, checkpoint
-resume inside the Unsloth-patched trainers, the vLLM server started for BFCL, GGUF export, and `unsloth run` on Colab.
-The `SMOKE` mode exists to check exactly these quickly. Known fallbacks: set `RUN_BFCL = False` to skip BFCL, use
-`SERVER = "vllm"` in the demo notebook, and set `PUSH_GGUF = False` to skip the GGUF build.
+Not verified yet, because it needs a GPU and Colab: a full (non-SMOKE) run and its scores; the current benchmark mix
+with the `chain_calc` and `dual_bridge` families; the teacher step (serving `Qwen/Qwen3-14B` with vLLM and sampling
+from it - its logic is tested on CPU with a scripted teacher); checkpoint resume after a real disconnect; and the
+model servers of `03_demo.ipynb`. Known fallbacks: `TEACHER = False` trains on the scripted expert only (the notebook
+also falls back to that by itself if the teacher step fails), `RUN_BFCL = False` skips BFCL, `SERVER = "vllm"` in the
+demo notebook, and `PUSH_GGUF = False` skips the GGUF build.
+
+Results are stored under `MyDrive/tool_use_demo/planner_<model>_v2[_smoke]/`. The `v2` is the task version: results
+from the first benchmark version stay in their old folder and are not mixed with the new ones.
 
 Two details worth knowing:
 
@@ -184,9 +208,8 @@ Two details worth knowing:
 
 ## Possible extensions
 
-- **Rejection sampling with a teacher** (see `code/rejection_sampling` in the RLHF book): seed synthetic queries from
-  the failure tags, have a stronger model produce several trajectories each, keep those that `scoring.py` rates 4,
-  and add them to the SFT mix. The scripted expert with its perfect-score filter is the simplest form of this.
+- A stronger or thinking teacher, or an API model, through `TEACHER_ENDPOINT`; seeding new teacher tasks from the
+  benchmark's failure tags instead of only from the expert's failures.
 - More environments in the GRPO stage through TRL's `environment_factory`, including stateful ones.
 - A Hugging Face Space for a demo that stays online without a Colab runtime.
 
