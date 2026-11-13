@@ -111,27 +111,28 @@ import os, subprocess, sys
 REPO_URL = "{REPO_URL}"
 REPO_BRANCH = "{REPO_BRANCH}"
 
-if os.path.isdir("planner"):                      # already inside a checkout
+REPO_DIR = "/content/tool_use_demo"
+if os.getcwd() != REPO_DIR and os.path.isdir("planner"):        # run from your own checkout: use it as it is
     REPO_DIR = os.getcwd()
-elif os.path.isdir("../planner"):
+elif os.getcwd() != REPO_DIR and os.path.isdir("../planner"):
     REPO_DIR = os.path.abspath("..")
-else:
-    REPO_DIR = "/content/tool_use_demo"
-    if not os.path.isdir(REPO_DIR):
-        url = REPO_URL
-        try:                                      # private repo: add a GITHUB_TOKEN secret
-            from google.colab import userdata
-            token = userdata.get("GITHUB_TOKEN")
-            if token: url = url.replace("https://", f"https://{{token}}@")
-        except Exception:
-            pass
-        subprocess.run(["git", "clone", "--depth", "1", "--branch", REPO_BRANCH, url, REPO_DIR], check=True)
-    else:                                         # an older clone: move it to the latest commit of REPO_BRANCH
-        for cmd in (["fetch", "--depth", "1", "origin", REPO_BRANCH], ["checkout", "-f", "-B", REPO_BRANCH, "FETCH_HEAD"]):
-            done = subprocess.run(["git", "-C", REPO_DIR] + cmd, capture_output=True, text=True)
-            if done.returncode: print("WARNING: git", cmd[0], "failed, the code in", REPO_DIR, "may be stale:", done.stderr.strip())
+elif not os.path.isdir(REPO_DIR):
+    url = REPO_URL
+    try:                                          # private repo: add a GITHUB_TOKEN secret
+        from google.colab import userdata
+        token = userdata.get("GITHUB_TOKEN")
+        if token: url = url.replace("https://", f"https://{{token}}@")
+    except Exception:
+        pass
+    subprocess.run(["git", "clone", "--depth", "1", "--branch", REPO_BRANCH, url, REPO_DIR], check=True)
+else:                                             # a clone from an earlier run: move it to the latest commit of REPO_BRANCH
+    for cmd in (["fetch", "--depth", "1", "origin", REPO_BRANCH], ["checkout", "-f", "-B", REPO_BRANCH, "FETCH_HEAD"]):
+        done = subprocess.run(["git", "-C", REPO_DIR] + cmd, capture_output=True, text=True)
+        if done.returncode: print("WARNING: git", cmd[0], "failed, the code in", REPO_DIR, "may be stale:", done.stderr.strip())
 os.chdir(REPO_DIR)
 if REPO_DIR not in sys.path: sys.path.insert(0, REPO_DIR)
+for _name in [m for m in sys.modules if m == "planner" or m.startswith("planner.")]:
+    del sys.modules[_name]                        # a session that already imported the old code picks up the new code
 head = subprocess.run(["git", "-C", REPO_DIR, "log", "-1", "--format=%h %s"], capture_output=True, text=True).stdout.strip()
 print("repo:", REPO_DIR, "@", head)
 '''
@@ -899,7 +900,13 @@ for endpoint in endpoints.values(): endpoint.stop()
     return cells
 
 
-def write(name: str, cells) -> None:
+def write(name: str, cells, keep_outputs: bool = True) -> None:
+    path = os.path.join(ROOT, "notebooks", name)
+    if keep_outputs and os.path.exists(path):  # keep the saved outputs of cells whose code did not change
+        saved = {c.source: c for c in nbformat.read(path, as_version=4).cells if c.cell_type == "code" and c.get("outputs")}
+        for cell in cells:
+            if cell.cell_type == "code" and cell.source in saved:
+                cell["outputs"], cell["execution_count"] = saved[cell.source]["outputs"], saved[cell.source]["execution_count"]
     notebook = new_notebook(cells=cells)
     notebook.metadata = {
         "accelerator": "GPU",
@@ -910,16 +917,17 @@ def write(name: str, cells) -> None:
     for i, cell in enumerate(notebook.cells):
         cell["id"] = f"cell-{i:02d}"  # stable ids -> stable diffs
     nbformat.validate(notebook)
-    path = os.path.join(ROOT, "notebooks", name)
     with open(path, "w", encoding="utf-8") as f:
         nbformat.write(notebook, f)
     print("wrote", path, f"({len(cells)} cells)")
 
 
 if __name__ == "__main__":
-    # `python scripts/build_notebooks.py 03_demo` rewrites only that notebook (writing a notebook drops its saved outputs).
+    # `python scripts/build_notebooks.py 03_demo` rewrites only that notebook. Saved outputs of unchanged cells are
+    # kept; `--clear` drops all outputs.
     import sys
 
     builders = {"01_sft": sft_notebook, "02_grpo": grpo_notebook, "03_demo": demo_notebook}
-    for stem in sys.argv[1:] or list(builders):
-        write(f"{stem}.ipynb", builders[stem]())
+    stems = [a for a in sys.argv[1:] if a != "--clear"]
+    for stem in stems or list(builders):
+        write(f"{stem}.ipynb", builders[stem](), keep_outputs="--clear" not in sys.argv)
