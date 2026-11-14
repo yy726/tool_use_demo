@@ -200,6 +200,11 @@ Two details worth knowing:
 - `bm25s` switches to JAX when JAX is installed, and JAX pre-allocates 75% of the GPU (about 30 GB of an A100-40GB,
   invisible to PyTorch). The first `knowledge_search` call therefore made the next generation step run out of memory.
   `planner/corpus.py` imports `bm25s` with JAX hidden and selects with numpy.
+- A full run of `01_sft.ipynb` once died with `CUDA error: an illegal memory access` inside Unsloth's custom decode
+  path, during a batched `generate()` on very short prompts. The cause was not pinned down (it cannot be reproduced
+  without that GPU). Mitigations in `planner/unsloth_utils.py`: generation only uses the prompt format the benchmark
+  uses, the GPU cache is no longer emptied between batches, and every batch is synchronised so a fault is reported
+  for the batch that caused it. `DEBUG_CUDA = True` in the first cell gives an exact stack trace if it happens again.
 - Everything lives on the `main` branch. Colab cannot resolve notebook paths on branches with a `/` in the name
   (saving back to GitHub then creates a stray folder named after the branch), so the notebooks clone `main`.
 - TRL's tool loop only accepts chat templates it recognises, and Unsloth's tokenizers ship modified Qwen3 templates.

@@ -138,6 +138,8 @@ print("repo:", REPO_DIR, "@", head)
 '''
 
 SETUP = '''
+if globals().get("DEBUG_CUDA"):                    # must be set before torch starts CUDA
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 import unsloth  # import before transformers / trl so its patches apply
 import json, random
 from planner.config import get_config
@@ -230,6 +232,7 @@ WANDB_PROJECT = "tool-use-planner"
 PUSH_TO_HUB = True           # push adapter + merged model (+ GGUF) to your Hugging Face account
 HF_PRIVATE = False
 PUSH_GGUF = True             # needed for Unsloth Studio / llama.cpp serving in 03_demo.ipynb
+DEBUG_CUDA = False           # True: synchronous GPU calls (slow) so a CUDA error points at the call that caused it
 OVERRIDES = {}               # e.g. {"sft_epochs": 1, "n_toolace": 5000}; see planner/config.py
 '''
         ),

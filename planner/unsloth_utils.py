@@ -105,8 +105,18 @@ def gpu_report(tag: str = "") -> None:
 def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int = 32):
     """Greedy batched generation with transformers. Call `FastLanguageModel.for_inference(model)` first.
 
-    Frees cached GPU memory between batches, and on a CUDA out-of-memory error retries the failed batch in halves
-    (down to one prompt) instead of losing the whole benchmark run.
+    On a CUDA out-of-memory error the failed batch is retried in halves (down to one prompt) instead of losing the
+    whole benchmark run.
+
+    Two deliberate details, both from a full run that died with "CUDA error: an illegal memory access" inside
+    Unsloth's decode path:
+
+    - `torch.cuda.empty_cache()` is NOT called between batches (only after an out-of-memory error). Unsloth's decode
+      step launches its own GPU kernels on raw pointers; as long as freed blocks stay in PyTorch's pool, a stale
+      pointer reads stale data, but once the pool hands them back to the driver the same read is a hard fault that
+      kills the CUDA context for the whole session.
+    - Each batch ends with `torch.cuda.synchronize()`, so an asynchronous GPU error is raised for the batch that
+      caused it, with that batch's shapes in the message, instead of somewhere in a later call.
     """
     import torch
 
@@ -117,8 +127,23 @@ def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int 
 
     def run(prompts: list[str]) -> list[str]:
         enc = tokenizer(prompts, return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
-        with torch.inference_mode():
-            out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id)
+        try:
+            with torch.inference_mode():
+                out = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tokenizer.pad_token_id)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except RuntimeError as error:
+            if "CUDA error" in str(error):
+                shape = tuple(enc["input_ids"].shape)
+                print(
+                    f"\nGPU fault during generation: batch of {shape[0]} prompts, padded to {shape[1]} tokens, max_new_tokens={max_new_tokens}.\n"
+                    "The CUDA context of this session is now unusable: choose Runtime > Restart session, then Run all\n"
+                    "(finished stages are on Drive and are skipped). To get an exact stack trace, set DEBUG_CUDA = True\n"
+                    "in the first cell before re-running; generation is then slower but errors are reported where they happen."
+                )
+            raise
         texts = tokenizer.batch_decode(out[:, enc["input_ids"].shape[1] :], skip_special_tokens=False)
         return [_clean(text, tokenizer) for text in texts]
 
@@ -144,7 +169,6 @@ def hf_generate_fn(model, tokenizer, max_new_tokens: int = 384, batch_size: int 
                 index = order[start : start + batch_size]
                 for i, text in zip(index, run_safe([prompts[i] for i in index])):
                     outputs[i] = text
-                free_memory()
         finally:
             tokenizer.padding_side = side
         return outputs

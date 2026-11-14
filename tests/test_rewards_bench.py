@@ -147,6 +147,13 @@ def test_hf_generate_fn_retries_oom_in_halves():
     assert model.sizes == [8, 4, 2, 2, 4, 2, 2]  # 8 -> 4+4 -> 2+2 each, until it fits
     assert tok.padding_side == "right"
 
+    class Faulty(Model):
+        def generate(self, input_ids, **kw):
+            raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    with pytest.raises(RuntimeError, match="illegal memory access"):
+        hf_generate_fn(Faulty(), tok, max_new_tokens=1, batch_size=8)(["p0", "p1"])  # not retried: the context is gone
+
 
 def test_report_has_a_multi_step_headline(world):
     rng = random.Random(3)
