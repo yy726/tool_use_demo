@@ -70,10 +70,15 @@ because single-call tasks are close to their ceiling after SFT and say little ab
 The headline number is the **multi-step good rate**: the good rate on the tasks whose cheapest plan needs at least two
 rounds (600 of the 800). The report also breaks the good rate down by the number of rounds a task needs (0 to 3).
 
-Each rollout is scored on two axes from 1 to 4 and the final score is the minimum; 3 and 4 count as good.
+Each rollout is scored on three axes from 1 to 4:
 
 - **Relevance**: did the plan go after every part of the question, without off-topic calls?
-- **Factuality**: is the answer correct and backed by evidence the tools returned?
+- **Groundedness**: is the final answer supported by what the tools returned in this rollout? Every number and every
+  content word of the answer is looked up in the results of the successful tool calls; no gold answer is involved.
+- **Factuality**: does the answer match the gold answer, backed by the gold evidence?
+
+A rollout is **good** when min(relevance, factuality) is 3 or 4 - the benchmark asks whether the user got a right
+answer. The GRPO reward uses a different pair, relevance and groundedness (see Training).
 
 Evidence is read only from tool messages, which Python writes. Bad rollouts are tagged with failure types
 (`specialized_tool_not_called`, `wrong_tool`, `wrong_arguments`, `constraint_missed`, `not_decomposed`,
@@ -92,7 +97,7 @@ calling, plus about 2.5k in-domain demonstrations. Those come from two sources:
 - a scripted expert that really runs the tools (only rollouts with a perfect score are kept). It is plain on purpose
   and fails about 30% of the multi-hop search tasks;
 - for those failed tasks, a **teacher** (`Qwen/Qwen3-14B` by default, or any OpenAI-compatible endpoint) attempts the
-  task up to four times in the same environment, and rollouts that score 4 on both axes are added
+  task up to four times in the same environment, and rollouts that score 4 on all three axes are added
   (`planner/teacher.py`). This is rejection sampling: the teacher proposes, the benchmark's scorer disposes.
 
 Two thirds of the in-domain tasks need two or three tool rounds. Unsloth + TRL `SFTTrainer`, LoRA rank 32, loss on
@@ -105,12 +110,17 @@ reward carry no learning signal, so rollouts are spent where the policy still fa
 The reward is rule-based:
 
 ```
-g = (min(relevance, factuality) - 1) / 3
+g = (min(relevance, groundedness) - 1) / 3
 R = g - 0.3 * min(1, excess_cost / 3) - 0.2 * invalid_fraction
 ```
 
+Factuality is deliberately left out of the reward: matching a gold answer string is the least stable of the three
+signals. The trade-off is that the reward cannot tell a right answer from a wrong one that is also taken from the
+retrieved evidence. Factuality is therefore still logged at every step and reported by the benchmark, so that drift
+would be visible. `REWARD_AXES = ("relevance", "factuality")` in `02_grpo.ipynb` restores the earlier reward.
+
 `excess_cost` is the cost above the task's cheapest correct plan. `REWARD_MODE` switches between `graded_cost`
-(default), `graded` and `binary`. Every step logs the good rate, both axes, tool cost, the share of zero-variance
+(default), `graded` and `binary`. Every step logs the good rate, all three axes, tool cost, the share of zero-variance
 groups, and a running count of tool calls (the "QPS bill" of the run) to W&B.
 
 The split of responsibilities: SFT teaches formats, schemas and the tool inventory with dense supervision and gets the
@@ -142,7 +152,7 @@ python -m planner.demo --base-url http://127.0.0.1:8888/v1 --api-key sk-unsloth-
 planner/
   tools.py, world.py, corpus.py   the four tools, the synthetic world, the BM25 knowledge base
   tasks.py                        the ten task families, gold labels, cheapest plans
-  trace.py, scoring.py            rollout parsing; relevance / factuality scores and failure tags
+  trace.py, scoring.py            rollout parsing; relevance / groundedness / factuality and failure tags
   rewards.py                      GRPO reward functions and the tool-call ledger
   bench.py                        PlannerQA-Bench loop and report
   expert.py, teacher.py           SFT data: scripted expert; teacher rollouts kept by rejection sampling

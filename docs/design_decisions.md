@@ -116,11 +116,12 @@ and the report also breaks the good rate down by rounds needed (0, 1, 2, 3).
 | `no_tool` | 50 | 0 | Restraint: answer without calling anything |
 
 Scoring:
-- Two axes, 1 to 4 each; the final score is the **minimum**; 3 and 4 count as good. This follows the structure of the
-  production autograder, keeping its two most important axes.
+- Three axes, 1 to 4 each.
 - **Relevance:** did some call address every part of the question, without off-topic calls?
-- **Factuality:** is the answer correct *and* was the required evidence returned by a tool? A correct answer without
-  evidence (a guess) gets at most 2.
+- **Groundedness:** is the final answer supported by what the tools returned in this rollout? Each number and each
+  content word of the answer is looked up in the results of the successful tool calls. No gold answer is needed.
+- **Factuality:** does the answer match the gold answer, *and* was the gold evidence returned by a tool?
+- **Good** (the benchmark's number) = min(relevance, factuality) is 3 or 4: did the user get a right answer.
 - **Failure tags** (`wrong_tool`, `constraint_missed`, `not_decomposed`, `query_rewrite_failed`,
   `multi_hop_incomplete`, `synthesis_error`, ...) show which kind of error each training stage removed.
 
@@ -129,16 +130,29 @@ Scoring:
 ## 6. Reward
 
 ```
-g = (min(relevance, factuality) - 1) / 3
+g = (min(relevance, groundedness) - 1) / 3
 R = g - 0.3 * min(1, excess_cost / 3) - 0.2 * invalid_fraction
 ```
 
+**Why relevance and groundedness, and not factuality.** Factuality depends on matching the model's answer against a
+gold answer string, which is the least stable signal (aliases, formatting, partially right answers; with an LLM judge
+it is also the axis with the most judge variance). Relevance and groundedness depend only on things the environment
+controls: which evidence the tool calls retrieved, and whether the answer's claims appear in the tool results.
+
+**What this gives up.** The reward cannot distinguish a right answer from a wrong one that is also drawn from the
+retrieved evidence (for example naming the other entity of a comparison). So factuality is still logged at every
+training step and is still what the benchmark's good rate uses. If groundedness rises while factuality stalls, the
+policy is exploiting that gap and factuality should go back into the reward (`REWARD_AXES`).
+
+**Guards.** An answer from memory has no evidence and earns 0. A pasted passage is capped (answers over 40 words score
+at most 2 on groundedness). A yes/no answer makes no checkable claim, so it relies on relevance alone.
+
 | Decision | Reason |
 |---|---|
-| Same scoring code as the benchmark | The thing optimised is the thing measured |
+| Same scorer as the benchmark, different axis pair | Reward on the stable axes; the benchmark keeps the gold-answer check to catch drift |
 | No LLM judge | Deterministic, free, not rate limited; about 12,800 rollouts would be costly and noisy to judge |
 | Graded, not binary | Partial credit gives a learning signal on hard families where most rollouts fail |
-| Minimum of the two axes, not the mean | Both must be good; guessing an answer or piling up searches cannot score well |
+| Minimum of relevance and groundedness, not the mean | Both must be good; answering from memory or piling up searches cannot score well |
 | Penalise only cost *above* the cheapest correct plan | Necessary calls are free; otherwise the model learns to call less rather than to call well |
 | Cost penalty capped at 0.3 | A correct answer always beats a cheap wrong one |
 | Separate 0.2 penalty for invalid calls | Direct signal for malformed calls and bad arguments |

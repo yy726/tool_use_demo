@@ -92,6 +92,7 @@ def _summarise(scores: list[Score]) -> dict:
         "good_rate": _mean(s.good for s in scores),
         "bad_rate": _mean(not s.good for s in scores),
         "relevance": _mean(s.relevance for s in scores),
+        "groundedness": _mean(s.groundedness for s in scores),
         "factuality": _mean(s.factuality for s in scores),
         "score": _mean(s.score for s in scores),
         "cost": _mean(s.cost for s in scores),
@@ -155,6 +156,7 @@ def format_report(reports: dict[str, dict]) -> str:
     rows = [
         ("good rate", "good_rate", "{:.1%}"),
         ("relevance (1-4)", "relevance", "{:.2f}"),
+        ("groundedness (1-4)", "groundedness", "{:.2f}"),
         ("factuality (1-4)", "factuality", "{:.2f}"),
         ("tool cost / query", "cost", "{:.2f}"),
         ("excess cost / query", "excess_cost", "{:.2f}"),

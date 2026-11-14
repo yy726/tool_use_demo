@@ -133,7 +133,7 @@ def format_markdown(result: dict, title: str | None = None) -> str:
     score = result.get("score")
     if score:
         verdict = "good" if score["good"] else "bad"
-        lines.append(f"**Score:** {verdict} - relevance {score['relevance']}/4, factuality {score['factuality']}/4" + (f", tags: {', '.join(score['tags'])}" if score["tags"] else ""))
+        lines.append(f"**Score:** {verdict} - relevance {score['relevance']}/4, groundedness {score.get('groundedness', '?')}/4, factuality {score['factuality']}/4" + (f", tags: {', '.join(score['tags'])}" if score["tags"] else ""))
     return "\n\n".join(lines)
 
 

@@ -4,7 +4,8 @@ The scripted expert only solves the tasks its fixed strategy happens to solve
 (about 70% of the knowledge-base multi-hop families), so SFT on its rollouts
 is capped there. Here a stronger model attempts the tasks the expert failed:
 it runs the same tool loop against the same environment, each attempt is
-scored by `scoring.py`, and only perfect rollouts (4 on both axes) are kept.
+scored by `scoring.py`, and only perfect rollouts (4 on relevance, groundedness
+and factuality) are kept.
 Failed tasks are retried up to `samples` times at a non-zero temperature.
 
 The teacher is any OpenAI-compatible endpoint. `generate_teacher_traces` can
@@ -86,7 +87,8 @@ def collect_teacher_traces(tasks: Sequence[dict], backend, samples: int = 4, bat
             attempts += len(chunk)
             for task, completion in zip(chunk, completions):
                 demo = as_demonstration(completion)
-                if score_messages(task, completion).score == 4 and score_messages(task, demo).score == 4:
+                final = score_messages(task, demo)
+                if score_messages(task, completion).score == 4 and final.score == 4 and final.groundedness == 4:
                     traces.append({"task_id": task["task_id"], "family": task["family"], "source": "teacher", "messages": build_prompt(task) + demo, "tools": TOOL_SCHEMAS})
                 else:
                     still_failing.append(task)

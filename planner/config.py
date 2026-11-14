@@ -79,6 +79,7 @@ class Config:
 
     # GRPO
     reward_mode: str = "graded_cost"
+    reward_axes: tuple = ("relevance", "groundedness")  # factuality (gold-answer matching) is reported, not rewarded
     grpo_lr: float = 5e-6
     grpo_steps: int = 400
     grpo_num_generations: int = 8

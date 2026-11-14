@@ -1,22 +1,28 @@
-"""Two-axis scoring of a planner rollout, plus failure tags.
+"""Rule-based scoring of a planner rollout on three axes (1-4 each), plus failure tags.
 
-This is a rule-based stand-in for an LLM autograder. Each axis is scored 1-4 and
-the final score is the minimum of the two; 3 and 4 count as a good answer.
+This is a stand-in for an LLM autograder.
 
-Relevance   - did the plan go after every part of what the user asked, without
-              off-topic tool calls?
-Factuality  - is the final answer correct, and is it backed by evidence that the
-              tools actually returned?
+Relevance    - did the plan go after every part of what the user asked, without
+               off-topic tool calls?
+Groundedness - is the final answer supported by what the tools returned in this
+               rollout? No gold answer is involved.
+Factuality   - is the final answer correct (it matches the gold answer), and is
+               it backed by the gold evidence?
 
-Evidence is read only from tool results (written by Python), never from what
-the model says it found.
+Two combinations are used. The benchmark's "good" is min(relevance, factuality)
+>= 3: it needs the gold answer and measures whether the user got a right answer.
+The GRPO reward is min(relevance, groundedness) (`Score.axis_min`): it does not
+depend on matching a gold answer string, which is the noisiest part of the
+scoring. Evidence is read only from tool results (written by Python), never
+from what the model says it found.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 
-from .textnorm import answer_matches, numbers_close
+from .textnorm import answer_matches, extract_numbers, normalize_text, numbers_close
 from .tools import MAX_CALLS_PER_ROUND, MAX_SEARCH_CALLS, MAX_TOOL_ROUNDS, TOOL_COSTS, UNKNOWN_TOOL_COST
 from .trace import Call, Trace, trace_from_messages
 from .world import canon
@@ -38,10 +44,20 @@ TAGS = (
 )
 
 
+# Words in an answer that carry no claim of their own (units, hedges): they need no support from a tool result.
+_FILLER = frozenset(
+    "of in on at to for by with from and or is was were are be it its that this as than about approximately roughly "
+    "degree degrees celsius c mm millimetre millimetres millimeter millimeters percent percentage point points pct "
+    "yes no answer total difference average mean both neither".split()
+)
+MAX_ANSWER_WORDS = 40  # a longer "answer" is a pasted passage, which would be trivially "supported"
+
+
 @dataclass
 class Score:
     relevance: int
     factuality: int
+    groundedness: int
     score: int
     good: bool
     cost: float
@@ -59,6 +75,10 @@ class Score:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def axis_min(self, axes=("relevance", "groundedness")) -> int:
+        """Minimum of the chosen axes; 1 when the rollout went over the tool budget."""
+        return 1 if self.over_budget else min(getattr(self, a) for a in axes)
 
 
 def _canon_args(args: dict | None) -> dict:
@@ -101,6 +121,42 @@ def _satisfies(call: Call, item: dict) -> bool:
         value = _calc_value(call)
         return value is not None and numbers_close(value, float(item["value"]))
     return False
+
+
+def groundedness_of(task: dict, trace: Trace) -> int:
+    """Is the final answer supported by what the tools returned in this rollout? (1-4, no gold answer involved)
+
+    The answer is split into its claims - every number and every content word -
+    and each claim is looked up in the results of the successful tool calls:
+
+    - 4: every claim is supported
+    - 3: at least half of the claims are supported
+    - 2: some claim is supported, or the "answer" is too long to be an answer
+    - 1: nothing is supported, no tool returned anything, or there is no final answer
+
+    A yes/no answer makes no checkable claim; it counts as supported when at
+    least one tool call succeeded. A task that needs no tool has nothing to
+    ground and scores 4 once it is answered.
+    """
+    final = trace.final_answer
+    if not (final and final.strip()):
+        return 1
+    if not task["aspects"]:
+        return 4
+    results = [c.result for c in trace.calls if c.executed and c.error is None]
+    if not results:
+        return 1
+    evidence = " ".join(r if isinstance(r, str) else json.dumps(r, ensure_ascii=False) for r in results)
+    evidence_words = set(normalize_text(evidence).split())
+    evidence_numbers = [abs(n) for n in extract_numbers(evidence)]
+    answer_numbers = [abs(n) for n in extract_numbers(final)]
+    words = [w for w in normalize_text(final).split() if w not in _FILLER and not w.replace(".", "").isdigit()]
+    claims = [any(numbers_close(n, e) for e in evidence_numbers) for n in answer_numbers] + [w in evidence_words for w in words]
+    if not claims:  # yes / no, or only filler words
+        return 4
+    supported = sum(claims) / len(claims)
+    level = 4 if supported == 1 else 3 if supported >= 0.5 else 2 if supported > 0 else 1
+    return min(level, 2) if len(final.split()) > MAX_ANSWER_WORDS else level
 
 
 def score_trace(task: dict, trace: Trace) -> Score:
@@ -162,6 +218,7 @@ def score_trace(task: dict, trace: Trace) -> Score:
     result = Score(
         relevance=relevance,
         factuality=factuality,
+        groundedness=groundedness_of(task, trace),
         score=score,
         good=score >= 3,
         cost=cost,

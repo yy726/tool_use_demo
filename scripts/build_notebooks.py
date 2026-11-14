@@ -202,7 +202,7 @@ when they are independent, and then answers.
 What it does, in order:
 
 1. **BFCL** on the base model (general function calling, official `bfcl-eval` pipeline).
-2. **PlannerQA-Bench** on the base model (our own held-out planning benchmark, scored on relevance and factuality).
+2. **PlannerQA-Bench** on the base model (our own held-out planning benchmark, scored on relevance, groundedness and factuality).
 3. Builds the SFT mix: public function-calling data (ToolACE + Hermes) and in-domain demonstrations from a scripted expert.
 4. **SFT** with Unsloth + TRL `SFTTrainer`, checkpointing to Google Drive.
 5. PlannerQA-Bench again, then pushes the adapter, merged weights and GGUF to the Hugging Face Hub.
@@ -327,10 +327,16 @@ calculator), `chain_calc` (two elections -> two weather lookups -> calculator: t
 bridge and a tool bridge interleaved in one ask), `composite` (two-part asks), and a smaller share of the
 single-round families `kb_compare`, `weather_lookup`, `election_lookup` and `no_tool`. The headline number is the
 **multi-step good rate**: the good rate on tasks that need at least two rounds.
-Each rollout gets two scores from 1 to 4 and the final score is their minimum (3 and 4 are "good"):
+Each rollout gets three scores from 1 to 4:
 
 - **relevance** - did the plan go after every part of the question, without off-topic calls?
-- **factuality** - is the answer correct and backed by what the tools returned?
+- **groundedness** - is the final answer supported by what the tools returned in this rollout? (no gold answer needed)
+- **factuality** - does the answer match the gold answer, backed by the gold evidence?
+
+A rollout is **good** when min(relevance, factuality) is 3 or 4: that is the benchmark's question, "did the user get a
+right answer". The GRPO reward in the next notebook uses relevance and groundedness instead and leaves factuality out,
+because matching a gold answer string is the least stable of the three signals. Reporting all three here shows whether
+a model trained that way drifts towards answers that are grounded but wrong.
 """
         ),
         code(
@@ -509,6 +515,7 @@ SMOKE = True                 # must match 01_sft.ipynb
 MODEL_KEY = "qwen3-1.7b"     # must match 01_sft.ipynb
 ENABLE_THINKING = False
 REWARD_MODE = "graded_cost"  # "graded_cost" (default) | "graded" | "binary"
+REWARD_AXES = ("relevance", "groundedness")   # the score axes the reward takes the minimum of; factuality is left out
 USE_DRIVE = True
 RESUME = True
 RUN_BFCL = True
@@ -523,7 +530,7 @@ OVERRIDES = {}               # e.g. {"grpo_steps": 200}; see planner/config.py
         code(INSTALL_GRPO),
         code(CHECK),
         code(CLONE),
-        code("OVERRIDES = dict(OVERRIDES, reward_mode=REWARD_MODE)\n" + SETUP.strip("\n")),
+        code("OVERRIDES = dict(OVERRIDES, reward_mode=REWARD_MODE, reward_axes=tuple(REWARD_AXES))\n" + SETUP.strip("\n")),
         md(
             """
 ## 3. BFCL on the SFT checkpoint
@@ -539,6 +546,7 @@ from planner.unsloth_utils import resolve_merged
 SFT_LORA = os.path.join(PERSIST, "sft_lora")
 SFT_MERGED = os.path.join(LOCAL, "sft_merged")
 STAGE = f"grpo_{cfg.reward_mode}"                  # reward ablations get their own folders and cache entries
+if tuple(cfg.reward_axes) != ("relevance", "groundedness"): STAGE += "_" + "-".join(a[:3] for a in cfg.reward_axes)
 GRPO_DIR = os.path.join(PERSIST, STAGE)
 GRPO_LORA = os.path.join(PERSIST, f"{STAGE}_lora")
 GRPO_MERGED = os.path.join(LOCAL, f"{STAGE}_merged")
@@ -589,13 +597,22 @@ The reward needs no LLM judge. Every training task carries gold labels: the answ
 must retrieve. Evidence is read only from tool messages, which Python writes, so the model cannot fake it.
 
 ```
-g = (min(relevance, factuality) - 1) / 3                       # 0, 1/3, 2/3 or 1
+g = (min(relevance, groundedness) - 1) / 3                     # 0, 1/3, 2/3 or 1
 R = g - 0.3 * min(1, excess_cost / 3) - 0.2 * invalid_fraction   # "graded_cost"
 ```
 
+- **relevance**: did the tool calls retrieve what every part of the question needs (gold evidence), without off-topic calls?
+- **groundedness**: is every claim in the final answer - each number, each content word - found in the results of the
+  rollout's own successful tool calls? No gold answer is involved.
+
+Factuality (does the answer match the gold answer string) is **not** part of the reward: string matching against a gold
+answer is the least stable signal. It is still logged at every step (`planner/factuality`) and reported by the
+benchmark, which is how you would notice the one thing this reward cannot see: an answer that is taken from the
+retrieved evidence but is the wrong part of it. `REWARD_AXES = ("relevance", "factuality")` restores the earlier reward.
+
 `excess_cost` is the cost above the task's cheapest correct plan: necessary calls are free, redundant ones are not.
-Taking the minimum of the two axes means guessing an answer without evidence earns at most 1/3, and retrieving
-evidence without answering earns 0.
+Taking the minimum means an answer from memory (no evidence retrieved) earns 0, retrieving the evidence without
+answering earns 0, and an "answer" that pastes a whole passage is capped at 1/3.
 
 The 4,000 training tasks are not spread evenly over the families (`cfg.grpo_mix`): about 70% need two or three
 dependent rounds. After SFT the single-call families get full reward on almost every rollout, so a group of eight
@@ -624,7 +641,7 @@ Each optimizer step uses `grpo_batch * grpo_accum / grpo_num_generations` prompt
 each. Rollouts stop when the model answers without a tool call, after three tool rounds, or when
 `max_completion_length` (which counts tool results too) is used up. No KL term (`beta = 0`).
 
-Logged to W&B every step: the reward, good rate, both axes, tool cost, the share of groups whose rollouts all got the
+Logged to W&B every step: the reward, good rate, all three axes, tool cost, the share of groups whose rollouts all got the
 same reward (those carry no learning signal), TRL's `tools/call_frequency` and `tools/failure_frequency`, and a running
 count of calls per tool under `qps/` - an estimate of what this run would cost against real tools.
 """
@@ -673,7 +690,7 @@ else:
     trainer = GRPOTrainer(
         model = model,
         processing_class = tokenizer,
-        reward_funcs = [make_reward_fn(cfg.reward_mode, ledger = ledger, print_every = 20)],
+        reward_funcs = [make_reward_fn(cfg.reward_mode, ledger = ledger, print_every = 20, axes = cfg.reward_axes)],
         tools = TOOLS,
         args = args,
         train_dataset = dataset,

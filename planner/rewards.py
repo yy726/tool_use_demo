@@ -1,7 +1,15 @@
-"""GRPO reward functions built on the two-axis score.
+"""GRPO reward functions built on the rule-based score.
 
-    g = (min(relevance, factuality) - 1) / 3                     in {0, 1/3, 2/3, 1}
+    g = (min(relevance, groundedness) - 1) / 3                   in {0, 1/3, 2/3, 1}
     R = g - 0.3 * min(1, excess_cost / 3) - 0.2 * invalid_fraction      ("graded_cost", default)
+
+The reward uses relevance (did the plan retrieve what every part of the question
+needs?) and groundedness (is the final answer supported by what the tools
+returned?). Factuality - matching the gold answer string - is left out of the
+reward: string matching against a gold answer is the least stable part of the
+scoring. It is still reported by the benchmark, so a model that learns to give
+grounded but wrong answers shows up there. `axes=("relevance", "factuality")`
+restores the earlier reward.
 
 `excess_cost` is the cost above the task's cheapest correct plan, so necessary
 calls are free and only redundant ones are penalised. No LLM judge is involved.
@@ -26,10 +34,14 @@ COST_SCALE = 3.0
 INVALID_WEIGHT = 0.2
 
 
-def reward_from_score(score: Score, mode: str = "graded_cost") -> float:
+REWARD_AXES = ("relevance", "groundedness")
+
+
+def reward_from_score(score: Score, mode: str = "graded_cost", axes: tuple = REWARD_AXES) -> float:
+    level = score.axis_min(axes)
     if mode == "binary":
-        return 1.0 if score.good else 0.0
-    graded = (score.score - 1) / 3.0
+        return 1.0 if level >= 3 else 0.0
+    graded = (level - 1) / 3.0
     if mode == "graded":
         return graded
     if mode == "graded_cost":
@@ -81,21 +93,25 @@ def zero_variance_fraction(task_ids: list[str], rewards: list[float]) -> float:
     return sum(max(g) - min(g) < 1e-9 for g in multi) / len(multi)
 
 
-def make_reward_fn(mode: str = "graded_cost", ledger: ToolLedger | None = None, print_every: int = 0):
-    """Build a TRL-compatible reward function for the given mode.
+def make_reward_fn(mode: str = "graded_cost", ledger: ToolLedger | None = None, print_every: int = 0, axes: tuple = REWARD_AXES):
+    """Build a TRL-compatible reward function for the given mode and score axes.
 
-    Besides returning the rewards it logs the two axes, the good rate, cost and
+    Besides returning the rewards it logs all three axes, the good rate, cost and
     per-tool call counts through TRL's `log_metric`, and updates the ledger.
     `print_every` > 0 prints one sample rollout every that many calls.
     """
     if mode not in REWARD_MODES:
         raise ValueError(f"unknown reward mode {mode!r}; choose from {REWARD_MODES}")
+    axes = tuple(axes)
+    unknown = set(axes) - {"relevance", "groundedness", "factuality"}
+    if unknown or not axes:
+        raise ValueError(f"reward axes must be chosen from relevance, groundedness, factuality; got {axes}")
     state = {"calls": 0}
 
     def reward_fn(prompts=None, completions=None, task=None, **kwargs):
         tasks = [json.loads(t) if isinstance(t, str) else t for t in task]
         scores = [score_messages(t, c) for t, c in zip(tasks, completions)]
-        rewards = [reward_from_score(s, mode) for s in scores]
+        rewards = [reward_from_score(s, mode, axes) for s in scores]
 
         if ledger is not None:
             for s in scores:
@@ -108,7 +124,9 @@ def make_reward_fn(mode: str = "graded_cost", ledger: ToolLedger | None = None, 
             metrics = {
                 "planner/good_rate": sum(s.good for s in scores) / n,
                 "planner/relevance": sum(s.relevance for s in scores) / n,
-                "planner/factuality": sum(s.factuality for s in scores) / n,
+                "planner/groundedness": sum(s.groundedness for s in scores) / n,
+                "planner/factuality": sum(s.factuality for s in scores) / n,  # reported, not rewarded by default
+                "planner/reward_axes_good_rate": sum(s.axis_min(axes) >= 3 for s in scores) / n,
                 "planner/cost": sum(s.cost for s in scores) / n,
                 "planner/excess_cost": sum(s.excess_cost for s in scores) / n,
                 "planner/invalid_fraction": sum(s.invalid_fraction for s in scores) / n,
@@ -131,7 +149,7 @@ def make_reward_fn(mode: str = "graded_cost", ledger: ToolLedger | None = None, 
             print("*" * 20, f"\n[{tasks[0]['family']}] {tasks[0]['query']}")
             for message in completions[0]:
                 print(f"[{message['role']}]", message.get("tool_calls") or message.get("content"))
-            print(f"-> relevance={scores[0].relevance} factuality={scores[0].factuality} cost={scores[0].cost} reward={rewards[0]:.3f} tags={scores[0].tags}")
+            print(f"-> relevance={scores[0].relevance} groundedness={scores[0].groundedness} factuality={scores[0].factuality} cost={scores[0].cost} reward={rewards[0]:.3f} tags={scores[0].tags}")
         state["calls"] += 1
         return rewards
 

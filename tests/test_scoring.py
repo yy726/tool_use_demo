@@ -216,3 +216,39 @@ def test_no_tool_family(world):
 )
 def test_answer_matching(prediction, answers, kind, expected):
     assert answer_matches(prediction, answers, kind) is expected
+
+
+# ------------------------------------------------------------- groundedness
+def test_groundedness_checks_the_answer_against_tool_results_not_against_gold(weather, bridge):
+    plan = plan_rounds(weather)
+    assert score_messages(weather, run(*plan, final=gold_answer(weather))).groundedness == 4
+    # A number or a name that no tool returned is not grounded, even though the right tool was called.
+    made_up = score_messages(weather, run(*plan, final="Answer: 987654 according to Zorblax"))
+    assert made_up.groundedness == 1 and made_up.relevance == 4
+    # An answer from memory has nothing to stand on.
+    assert score_messages(weather, run(final=gold_answer(weather))).groundedness == 1
+    assert score_messages(weather, run(*plan, final="")).groundedness == 1
+    # Grounded but wrong: the text comes from the retrieved passages, it is just not the answer.
+    wrong = score_messages(bridge, run(*plan_rounds(bridge), final="Answer: Silver Lantern"))
+    assert wrong.groundedness == 4 and wrong.factuality == 1 and not wrong.good
+    # Pasting a passage is not an answer.
+    pasted = score_messages(bridge, run(*plan_rounds(bridge), final="Answer: " + "Silver Lantern director born " * 15))
+    assert pasted.groundedness <= 2
+
+
+def test_reward_uses_relevance_and_groundedness_and_leaves_factuality_out(bridge, weather):
+    from planner.rewards import make_reward_fn
+
+    grounded_but_wrong = run(*plan_rounds(bridge), final="Answer: Silver Lantern")
+    s = score_messages(bridge, grounded_but_wrong)
+    assert s.axis_min() == 4 and s.axis_min(("relevance", "factuality")) == 1
+    assert reward_from_score(s, "graded") == 1.0  # the default reward cannot see that this is wrong ...
+    assert reward_from_score(s, "graded", axes=("relevance", "factuality")) == 0.0  # ... factuality can
+    logged = {}
+    rewards = make_reward_fn("graded")(completions=[grounded_but_wrong], task=[bridge], log_metric=logged.__setitem__)
+    assert rewards == [1.0] and logged["planner/groundedness"] == 4 and logged["planner/factuality"] == 1
+    assert logged["planner/reward_axes_good_rate"] == 1.0 and logged["planner/good_rate"] == 0.0
+    # From memory: correct, but not grounded and nothing retrieved -> no reward.
+    assert reward_from_score(score_messages(weather, run(final=gold_answer(weather))), "graded") == 0.0
+    with pytest.raises(ValueError):
+        make_reward_fn("graded", axes=("vibes",))
