@@ -361,9 +361,11 @@ if RESUME and os.path.exists(SFT_DATA):
     texts = [row["text"] for row in read_jsonl(SFT_DATA)]      # identical data and order after a restart
 else:
     FastLanguageModel.for_inference(model)
-    plain = hf_generate_fn(model, tokenizer, max_new_tokens=128, batch_size=cfg.bench_batch)
-    def direct_answers(queries):                               # no_tool tasks: the base model's own tool-free reply
-        return plain([fmt.render_prompt([{"role": "user", "content": q}], tools=None) for q in queries])
+    generate = hf_generate_fn(model, tokenizer, MAX_NEW, cfg.bench_batch)
+    def direct_answers(queries):
+        # no_tool tasks: the base model's own reply, generated exactly like a benchmark turn (same system prompt,
+        # same tool list, same generation settings). Replies that call a tool anyway are dropped.
+        return generate([fmt.render_prompt(build_prompt({"query": q})) for q in queries])
     traces = build_expert_traces(env.tasks["sft"], direct_answer_fn=direct_answers) + TEACHER_TRACES
     print("in-domain demonstrations per family:", dict(Counter(t["family"] for t in traces)), "| from the teacher:", len(TEACHER_TRACES))
     public = load_public_examples(cfg.n_toolace, cfg.n_hermes, cfg.seed)

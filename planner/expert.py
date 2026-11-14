@@ -113,7 +113,7 @@ def build_expert_traces(
     """Demonstrations for SFT: `{"messages": [...], "tools": [...], "task_id", "family"}`.
 
     `direct_answer_fn(queries) -> answers` supplies the reply for no_tool tasks
-    (in the notebook: the base model answering without tools). Without it,
+    (in the notebook: the base model answering the benchmark prompt). Without it,
     no_tool tasks are skipped.
     """
     traces = []
